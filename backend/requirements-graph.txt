@@ -1,0 +1,5 @@
+-r requirements-core.txt
+neo4j==5.28.0
+chromadb==0.5.23
+sentence-transformers==3.3.1
+numpy==1.26.4

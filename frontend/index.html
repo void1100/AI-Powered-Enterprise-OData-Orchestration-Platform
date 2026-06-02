@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OData Orchestration Chat</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <h2>Chats</h2>
+        <button id="newChatBtn" title="New chat">+</button>
+      </div>
+      <ul id="sessionList" class="session-list"></ul>
+      <div class="sidebar-footer">
+        <label>Role:
+          <select id="roleSelect">
+            <option>Admin</option>
+            <option>Sales</option>
+            <option>Analyst</option>
+            <option>Viewer</option>
+          </select>
+        </label>
+        <div class="status-line">
+          <span id="statusDot" class="dot"></span>
+          <span id="statusText">checking...</span>
+        </div>
+      </div>
+    </aside>
+
+    <main id="main">
+      <header class="topbar">
+        <h1>Advanced OData Service Orchestration</h1>
+        <div class="topbar-actions">
+          <button id="servicesBtn">Services</button>
+        </div>
+      </header>
+
+      <section id="messages" class="messages">
+        <div class="empty-state">
+          <h2>Ask anything about your OData services</h2>
+          <p>Try: "Show top 5 customers from Germany" or "List all products in Beverages category"</p>
+        </div>
+      </section>
+
+      <footer class="composer">
+        <textarea id="queryInput" placeholder="Ask a natural-language question..." rows="2"></textarea>
+        <button id="sendBtn">Send</button>
+      </footer>
+    </main>
+
+    <div id="servicesModal" class="modal hidden">
+      <div class="modal-content">
+        <header>
+          <h2>Registered OData Services</h2>
+          <button class="close" id="closeServices">x</button>
+        </header>
+        <form id="addServiceForm">
+          <input type="text" id="svcId" placeholder="service id (e.g. crm)" required />
+          <input type="text" id="svcName" placeholder="display name" required />
+          <input type="url" id="svcUrl" placeholder="base url" required />
+          <input type="text" id="svcDesc" placeholder="description" />
+          <button type="submit">Register</button>
+        </form>
+        <ul id="serviceList" class="service-list"></ul>
+      </div>
+    </div>
+  </div>
+  <script src="./app.js"></script>
+</body>
+</html>

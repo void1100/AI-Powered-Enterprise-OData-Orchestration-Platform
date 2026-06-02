@@ -1,0 +1,283 @@
+"""OData service manager.
+
+Maintains a registry of OData services, their clients, and their metadata.
+Provides discovery, indexing, and dispatch.
+"""
+import asyncio
+from typing import Any, Dict, List, Optional, Tuple
+from loguru import logger
+
+from app.db.neo4j_client import neo4j_client
+from app.db.memory_graph import get_memory_graph
+from app.db.vector_store import vector_store
+from app.services.odata_client import ODataClient
+from app.services.odata_request_builder import ODataRequestBuilder
+from app.services.response_sanitizer import sanitize
+
+
+KNOWN_RELATIONSHIPS: Dict[str, List[Dict[str, Any]]] = {
+    "northwind": [
+        {"from": "Customers", "to": "Orders", "rel_type": "PLACES", "cardinality": "1_to_many",
+         "join_field": "CustomerID",
+         "description": "Each customer can place many orders; orders are linked back via CustomerID."},
+        {"from": "Orders", "to": "Customers", "rel_type": "PLACED_BY", "cardinality": "many_to_1",
+         "join_field": "CustomerID",
+         "description": "Each order is placed by exactly one customer (CustomerID)."},
+        {"from": "Orders", "to": "Order_Details", "rel_type": "CONTAINS", "cardinality": "1_to_many",
+         "join_field": "OrderID",
+         "description": "Each order has one or more line items in Order_Details."},
+        {"from": "Products", "to": "Order_Details", "rel_type": "INCLUDED_IN", "cardinality": "1_to_many",
+         "join_field": "ProductID",
+         "description": "Each product can appear in many order details."},
+        {"from": "Products", "to": "Categories", "rel_type": "BELONGS_TO", "cardinality": "many_to_1",
+         "join_field": "CategoryID",
+         "description": "Each product belongs to exactly one category."},
+        {"from": "Products", "to": "Suppliers", "rel_type": "SUPPLIED_BY", "cardinality": "many_to_1",
+         "join_field": "SupplierID",
+         "description": "Each product is supplied by exactly one supplier."},
+        {"from": "Suppliers", "to": "Products", "rel_type": "SUPPLIES", "cardinality": "1_to_many",
+         "join_field": "SupplierID",
+         "description": "Each supplier provides one or more products."},
+        {"from": "Categories", "to": "Products", "rel_type": "HAS", "cardinality": "1_to_many",
+         "join_field": "CategoryID",
+         "description": "Each category has one or more products."},
+        {"from": "Employees", "to": "Orders", "rel_type": "PROCESSED", "cardinality": "1_to_many",
+         "join_field": "EmployeeID",
+         "description": "Each employee can process many orders."},
+        {"from": "Shippers", "to": "Orders", "rel_type": "SHIPS", "cardinality": "1_to_many",
+         "join_field": "ShipperID",
+         "description": "Each shipper can ship many orders."},
+        {"from": "Employees", "to": "Territories", "rel_type": "ASSIGNED_TO", "cardinality": "many_to_many",
+         "join_field": "EmployeeTerritories",
+         "description": "Employees cover one or more sales territories."},
+    ],
+}
+
+
+class ODataServiceManager:
+    def __init__(self):
+        self._services: Dict[str, Dict[str, Any]] = {}
+        self._clients: Dict[str, ODataClient] = {}
+        self._entity_to_set: Dict[str, Dict[str, str]] = {}
+        self._lock = asyncio.Lock()
+
+    def graph(self):
+        return neo4j_client if neo4j_client.is_available() else get_memory_graph()
+
+    async def register_service(
+        self,
+        service_id: str,
+        name: str,
+        base_url: str,
+        description: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        async with self._lock:
+            client = ODataClient(base_url)
+            try:
+                meta = await client.get_metadata()
+            except Exception as e:
+                logger.warning(f"Failed to fetch metadata for {name} ({base_url}): {e}")
+                meta = {"entity_types": [], "entity_sets": [], "associations": [], "namespace": ""}
+            self._services[service_id] = {
+                "id": service_id,
+                "name": name,
+                "base_url": base_url,
+                "description": description,
+                "metadata": meta,
+                "extra": metadata or {},
+            }
+            self._clients[service_id] = client
+            self._index_service_in_graph(service_id, self._services[service_id])
+            self._index_service_in_vector_store(service_id, self._services[service_id])
+            return self._services[service_id]
+
+    def _index_service_in_graph(self, service_id: str, svc: Dict[str, Any]):
+        g = self.graph()
+        g.upsert_service({
+            "id": service_id,
+            "name": svc["name"],
+            "base_url": svc["base_url"],
+            "description": svc["description"],
+            "metadata": svc.get("extra", {}),
+        })
+        entity_set_to_type: Dict[str, str] = {}
+        for es in svc["metadata"].get("entity_sets", []):
+            entity_set_to_type[es["name"]] = es.get("entity_type") or es["name"]
+        self._entity_to_set[service_id] = entity_set_to_type
+        for es in svc["metadata"].get("entity_sets", []):
+            et_name = (es.get("entity_type") or es["name"]).split(".")[-1]
+            et = next(
+                (e for e in svc["metadata"].get("entity_types", [])
+                 if e["name"] == et_name or f"{e['namespace']}.{e['name']}" == es.get("entity_type")),
+                None,
+            )
+            props = et.get("properties", []) if et else []
+            allowed_ops = ["select", "filter", "expand", "orderby", "top", "skip"]
+            g.upsert_entity({
+                "service_id": service_id,
+                "name": es["name"],
+                "type": et_name,
+                "description": f"Entity set {es['name']} of {et_name}. {svc['description']}",
+                "allowed_ops": allowed_ops,
+                "properties": [p["name"] for p in props],
+            })
+        for assoc in svc["metadata"].get("associations", []):
+            for from_role, to_role in [("end1", "end2"), ("end2", "end1")]:
+                from_type = assoc[from_role]["type"]
+                to_type = assoc[to_role]["type"]
+                from_set = next((es for es in svc["metadata"]["entity_sets"] if es.get("entity_type") == from_type), None)
+                to_set = next((es for es in svc["metadata"]["entity_sets"] if es.get("entity_type") == to_type), None)
+                if from_set and to_set:
+                    g.upsert_relationship({
+                        "from_service": service_id,
+                        "from_name": from_set["name"],
+                        "to_service": service_id,
+                        "to_name": to_set["name"],
+                        "rel_type": assoc.get("name", "ASSOCIATED_WITH"),
+                        "cardinality": f'{assoc[from_role]["multiplicity"]}_to_{assoc[to_role]["multiplicity"]}',
+                        "description": f"{from_set['name']} relates to {to_set['name']} via {assoc.get('name')}",
+                    })
+        for rel in KNOWN_RELATIONSHIPS.get(service_id, []):
+            if rel["from"] in entity_set_to_type and rel["to"] in entity_set_to_type:
+                g.upsert_relationship({
+                    "from_service": service_id,
+                    "from_name": rel["from"],
+                    "to_service": service_id,
+                    "to_name": rel["to"],
+                    "rel_type": rel["rel_type"],
+                    "cardinality": rel["cardinality"],
+                    "description": rel["description"],
+                })
+
+    def _index_service_in_vector_store(self, service_id: str, svc: Dict[str, Any]):
+        items: List[Dict[str, Any]] = []
+        for es in svc["metadata"].get("entity_sets", []):
+            et_name = (es.get("entity_type") or es["name"]).split(".")[-1]
+            et = next(
+                (e for e in svc["metadata"].get("entity_types", [])
+                 if e["name"] == et_name or f"{e['namespace']}.{e['name']}" == es.get("entity_type")),
+                None,
+            )
+            prop_names = [p["name"] for p in (et or {}).get("properties", [])]
+            text = (
+                f"Service: {svc['name']}. Entity set: {es['name']}. "
+                f"Description: {svc['description']}. "
+                f"Columns: {', '.join(prop_names)}."
+            )
+            items.append({
+                "id": f"{service_id}::{es['name']}",
+                "text": text,
+                "metadata": {
+                    "service_id": service_id,
+                    "service_name": svc["name"],
+                    "entity_set": es["name"],
+                    "entity_type": et_name,
+                    "properties": prop_names,
+                },
+            })
+        for rel in KNOWN_RELATIONSHIPS.get(service_id, []):
+            text = (
+                f"Relationship in {svc['name']}: {rel['from']} {rel['rel_type']} {rel['to']}. "
+                f"Cardinality: {rel['cardinality']}. {rel['description']}"
+            )
+            items.append({
+                "id": f"{service_id}::rel::{rel['from']}->{rel['to']}",
+                "text": text,
+                "metadata": {
+                    "service_id": service_id,
+                    "service_name": svc["name"],
+                    "from_entity": rel["from"],
+                    "to_entity": rel["to"],
+                    "rel_type": rel["rel_type"],
+                },
+            })
+        if items:
+            vector_store.index_tools_bulk(items)
+
+    async def refresh_service(self, service_id: str) -> Optional[Dict[str, Any]]:
+        if service_id not in self._services:
+            return None
+        svc = self._services[service_id]
+        client = self._clients[service_id]
+        try:
+            meta = await client.get_metadata(force_refresh=True)
+        except Exception as e:
+            logger.warning(f"Refresh failed for {service_id}: {e}")
+            return svc
+        svc["metadata"] = meta
+        self._index_service_in_graph(service_id, svc)
+        self._index_service_in_vector_store(service_id, svc)
+        return svc
+
+    def list_services(self) -> List[Dict[str, Any]]:
+        out = []
+        for sid, svc in self._services.items():
+            out.append({
+                "id": sid,
+                "name": svc["name"],
+                "base_url": svc["base_url"],
+                "description": svc["description"],
+                "entity_sets": [es["name"] for es in svc["metadata"].get("entity_sets", [])],
+            })
+        return out
+
+    async def recover_from_graph(self):
+        """Restore service registrations from the graph DB and refresh
+        metadata from the upstream OData endpoint. Used at backend startup
+        so the in-memory service map stays consistent across restarts.
+        """
+        g = self.graph()
+        try:
+            persisted = g.list_all_services()
+        except Exception as e:
+            logger.warning(f"Could not read services from graph: {e}")
+            return
+        for svc in persisted:
+            sid = svc.get("id")
+            base_url = svc.get("base_url")
+            name = svc.get("name")
+            description = svc.get("description", "")
+            if not sid or not base_url:
+                continue
+            if sid in self._services:
+                continue
+            try:
+                logger.info(f"Recovering service {sid} from graph ...")
+                await self.register_service(
+                    service_id=sid,
+                    name=name or sid,
+                    base_url=base_url,
+                    description=description,
+                )
+                logger.info(f"  {sid}: recovered")
+            except Exception as e:
+                logger.warning(f"  Failed to recover {sid}: {e}")
+
+    def get_service(self, service_id: str) -> Optional[Dict[str, Any]]:
+        return self._services.get(service_id)
+
+    def get_client(self, service_id: str) -> Optional[ODataClient]:
+        return self._clients.get(service_id)
+
+    async def execute_plan(
+        self,
+        service_id: str,
+        plan: Dict[str, Any],
+        allowed_ops: Optional[list] = None,
+        max_rows: int = 50,
+    ) -> Dict[str, Any]:
+        client = self.get_client(service_id)
+        if not client:
+            raise ValueError(f"Unknown service: {service_id}")
+        builder = ODataRequestBuilder(client, allowed_ops=allowed_ops)
+        execution = await builder.execute(plan)
+        sanitized = sanitize(execution["result"], max_rows=max_rows)
+        return {
+            "service_id": service_id,
+            "url": execution["url"],
+            "table": sanitized,
+        }
+
+
+service_manager = ODataServiceManager()

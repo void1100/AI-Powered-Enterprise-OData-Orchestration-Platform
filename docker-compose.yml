@@ -1,0 +1,121 @@
+services:
+
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: odata-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/password
+      NEO4J_PLUGINS: '[]'
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 128m
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 10
+
+  sample-odata:
+    build:
+      context: .
+      dockerfile: sample_odata_service/Dockerfile
+    container_name: odata-sample
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:5000/Customers?$top=1' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: odata-backend
+    restart: unless-stopped
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: password
+      CHROMA_PERSIST_DIR: /app/data/chroma_db
+      SQLITE_DB_PATH: /app/data/app.db
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8000"
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      CORS_ORIGINS: "http://localhost,http://localhost:80,http://localhost:3000,http://frontend,http://frontend:80"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      sample-odata:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    volumes:
+      - backend_data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  seeder:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: odata-seeder
+    depends_on:
+      backend:
+        condition: service_healthy
+      sample-odata:
+        condition: service_started
+      neo4j:
+        condition: service_healthy
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: password
+      CHROMA_PERSIST_DIR: /app/data/chroma_db
+      SQLITE_DB_PATH: /app/data/app.db
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      SEED_LOCAL_SAMPLE: "1"
+      SAMPLE_ODATA_URL: http://sample-odata:5000
+      NORTHWIND_URL: https://services.odata.org/V4/Northwind/Northwind.svc
+    volumes:
+      - backend_data:/app/data
+    entrypoint: ["python", "-m", "scripts.seed_sample_service"]
+    restart: "no"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: odata-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+
+volumes:
+  neo4j_data:
+  backend_data:
