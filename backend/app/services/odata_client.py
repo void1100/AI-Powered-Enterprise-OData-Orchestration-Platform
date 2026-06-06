@@ -40,7 +40,7 @@ class ODataClient:
         if self._metadata_cache and not force_refresh:
             return self._metadata_cache
         url = f"{self.base_url}/$metadata"
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
             resp = await client.get(url, headers={"Accept": "application/xml"})
             resp.raise_for_status()
             xml_text = resp.text
@@ -145,7 +145,7 @@ class ODataClient:
             if et_name in et_by_name and et_by_name[et_name].get("properties"):
                 continue
             try:
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
                     resp = await client.get(
                         f"{self.base_url}/{es['name']}?$top=1",
                         headers={"Accept": "application/json"},
@@ -235,7 +235,7 @@ class ODataClient:
             entity_set, select=select, filter_expr=filter_expr,
             expand=expand, top=top, skip=skip, orderby=orderby, count=True,
         )
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
             resp = await client.get(url, headers={"Accept": "application/json"})
             resp.raise_for_status()
             data = resp.json()
@@ -244,7 +244,7 @@ class ODataClient:
     async def get_by_id(self, entity_set: str, entity_id: str, select: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         qs = f"?$select={','.join(select)}" if select else ""
         url = f"{self.base_url}/{entity_set}({entity_id}){qs}"
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
             resp = await client.get(url, headers={"Accept": "application/json"})
             if resp.status_code == 404:
                 return None
