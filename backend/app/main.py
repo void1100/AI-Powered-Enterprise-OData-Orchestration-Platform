@@ -365,6 +365,52 @@ async def analyze_table(payload: Dict[str, Any]):
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
 
+@app.post("/ml/clean")
+async def ml_clean(payload: Dict[str, Any]):
+    table = payload.get("table")
+    options = payload.get("options", {})
+    if not table or not table.get("rows"):
+        raise HTTPException(status_code=400, detail="No table data to clean")
+    from app.services.data_cleaner import clean_data
+    try:
+        result = clean_data(table["rows"], table["columns"], options)
+        return result
+    except Exception as e:
+        logger.error(f"Data cleaning failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Cleaning failed: {str(e)}")
+
+
+@app.post("/ml/train")
+async def ml_train(payload: Dict[str, Any]):
+    table = payload.get("table")
+    target_col = payload.get("target_column")
+    algorithm = payload.get("algorithm", "random_forest")
+    options = payload.get("options", {})
+    compare = payload.get("compare", False)
+    if not table or not table.get("rows"):
+        raise HTTPException(status_code=400, detail="No table data to train on")
+    if not target_col:
+        raise HTTPException(status_code=400, detail="target_column is required")
+
+    from app.services.ml_supervised import train_model, train_and_compare
+    try:
+        if compare:
+            algorithms = payload.get("algorithms", ["decision_tree", "random_forest", "logistic_regression", "xgboost", "gradient_boosting"])
+            result = train_and_compare(table["rows"], table["columns"], target_col, algorithms)
+        else:
+            result = train_model(table["rows"], table["columns"], target_col, algorithm, options)
+        return result
+    except Exception as e:
+        logger.error(f"ML training failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Training failed: {str(e)}")
+
+
+@app.get("/ml/algorithms")
+async def ml_algorithms():
+    from app.services.ml_supervised import ALGORITHMS
+    return {"algorithms": ALGORITHMS}
+
+
 @app.get("/mcp/tools")
 async def mcp_tools():
     return {"tools": mcp_server.tools}

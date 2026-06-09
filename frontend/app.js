@@ -633,6 +633,223 @@ function renderAnalyzeResults(result) {
   return html;
 }
 
+function renderTrainResults(result) {
+  if (result.error) return `<div class="analyze-error">${escapeHtml(result.error)}</div>`;
+  let html = "";
+  if (result.results) {
+    html += `<div class="analyze-header"><span class="analyze-badge">Best: ${escapeHtml(ALGO_NAMES[result.best_algorithm] || result.best_algorithm)}</span> <span class="analyze-badge">Score: ${result.best_score}</span> <span class="analyze-badge">${result.algorithms_tested} tested</span></div>`;
+    for (const [algo, res] of Object.entries(result.results)) {
+      if (res.error) { html += `<div class="analyze-card"><div class="analyze-card-title">${escapeHtml(ALGO_NAMES[algo] || algo)}</div><div class="analyze-card-desc error">${escapeHtml(res.error)}</div></div>`; continue; }
+      html += renderSingleTrainResult(algo, res, algo === result.best_algorithm);
+    }
+  } else {
+    html += renderSingleTrainResult(result.algorithm_key, result, true);
+  }
+  return html;
+}
+
+const ALGO_NAMES = { decision_tree:"Decision Tree", random_forest:"Random Forest", xgboost:"XGBoost", catboost:"CatBoost", logistic_regression:"Logistic Regression", knn:"K-Nearest Neighbors", svm:"Support Vector Machine", gradient_boosting:"Gradient Boosting", ada_boost:"Ada Boost", extra_trees:"Extra Trees", naive_bayes:"Naive Bayes" };
+
+function renderSingleTrainResult(algo, res, isBest) {
+  let html = `<div class="analyze-card${isBest ? " best-algo" : ""}"><div class="analyze-card-title">${escapeHtml(ALGO_NAMES[algo] || algo)}${isBest ? ' <span class="best-badge">BEST</span>' : ""}</div>`;
+  html += `<div class="analyze-card-desc">${res.task_type} · ${res.sample_count} samples · Target: ${escapeHtml(res.target_column)}</div>`;
+  const m = res.metrics;
+  if (res.task_type === "classification") {
+    html += `<div class="metrics-row"><div class="metric"><span class="metric-val">${m.accuracy}</span><span class="metric-lbl">Accuracy</span></div><div class="metric"><span class="metric-val">${m.precision}</span><span class="metric-lbl">Precision</span></div><div class="metric"><span class="metric-val">${m.recall}</span><span class="metric-lbl">Recall</span></div><div class="metric"><span class="metric-val">${m.f1}</span><span class="metric-lbl">F1</span></div></div>`;
+  } else {
+    html += `<div class="metrics-row"><div class="metric"><span class="metric-val">${m.r2}</span><span class="metric-lbl">R²</span></div><div class="metric"><span class="metric-val">${m.mae}</span><span class="metric-lbl">MAE</span></div><div class="metric"><span class="metric-val">${m.rmse}</span><span class="metric-lbl">RMSE</span></div></div>`;
+  }
+  if (res.confusion_matrix) {
+    html += `<div class="analyze-subtitle">Confusion Matrix</div>`;
+    const labels = res.confusion_matrix_labels || [];
+    html += `<div class="cm-wrap"><table class="cm-table"><thead><tr><th></th>`;
+    for (const l of labels) html += `<th>${escapeHtml(String(l))}</th>`;
+    html += `</tr></thead><tbody>`;
+    for (let i = 0; i < res.confusion_matrix.length; i++) {
+      html += `<tr><th>${escapeHtml(labels[i] || String(i))}</th>`;
+      for (let j = 0; j < res.confusion_matrix[i].length; j++) {
+        const v = res.confusion_matrix[i][j];
+        const cls = i === j ? "cm-diag" : (v > 0 ? "cm-err" : "");
+        html += `<td class="${cls}">${v}</td>`;
+      }
+      html += `</tr>`;
+    }
+    html += `</tbody></table></div>`;
+  }
+  if (res.feature_importance && res.feature_importance.length > 0) {
+    html += `<div class="analyze-subtitle">Feature Importance</div><div class="analyze-table-wrap"><table class="analyze-table"><thead><tr><th>Column</th><th>Importance</th><th></th></tr></thead><tbody>`;
+    const maxImp = res.feature_importance[0].importance || 1;
+    for (const fi of res.feature_importance) {
+      const pct = maxImp > 0 ? (fi.importance / maxImp) * 100 : 0;
+      html += `<tr><td>${escapeHtml(fi.column)}</td><td>${fi.importance}</td><td><div class="importance-bar"><div class="importance-fill" style="width:${pct}%"></div></div></td></tr>`;
+    }
+    html += `</tbody></table></div>`;
+  }
+  html += `</div>`;
+  return html;
+}
+
+function renderCleanResults(result) {
+  let html = `<div class="analyze-header"><span class="analyze-badge">${result.report.original_rows} → ${result.report.final_rows} rows</span> <span class="analyze-badge">${result.report.original_columns} → ${result.report.final_columns} cols</span></div>`;
+  if (result.report.steps.length === 0) {
+    html += `<div class="analyze-card"><div class="analyze-card-title">No Changes</div><div class="analyze-card-desc">Data was already clean.</div></div>`;
+  } else {
+    html += `<div class="analyze-card"><div class="analyze-card-title">Cleaning Steps</div>`;
+    html += `<div class="analyze-table-wrap"><table class="analyze-table"><thead><tr><th>Step</th><th>Details</th></tr></thead><tbody>`;
+    for (const s of result.report.steps) {
+      let detail = "";
+      if (s.step === "remove_duplicates") detail = `Removed ${s.removed} duplicate rows`;
+      else if (s.step === "drop_missing") detail = `Dropped ${s.dropped} rows with missing values`;
+      else if (s.step.startsWith("fill_")) detail = `Filled ${s.filled} missing values in ${s.column} with ${s.value} (${s.step.replace("fill_", "")})`;
+      else if (s.step === "remove_outliers") detail = `Removed ${s.removed} outliers from ${s.column} using ${s.method}`;
+      else if (s.step === "normalize") detail = `Normalized ${s.column} using ${s.method}`;
+      else if (s.step === "encode") detail = `Encoded ${s.column} → ${s.categories} binary columns`;
+      else detail = JSON.stringify(s);
+      html += `<tr><td><strong>${escapeHtml(s.step)}</strong></td><td>${escapeHtml(detail)}</td></tr>`;
+    }
+    html += `</tbody></table></div></div>`;
+  }
+  return html;
+}
+
+const ALGO_OPTIONS = [
+  { value: "decision_tree", label: "Decision Tree" },
+  { value: "random_forest", label: "Random Forest" },
+  { value: "xgboost", label: "XGBoost" },
+  { value: "catboost", label: "CatBoost" },
+  { value: "logistic_regression", label: "Logistic Regression" },
+  { value: "knn", label: "K-Nearest Neighbors" },
+  { value: "svm", label: "Support Vector Machine" },
+  { value: "gradient_boosting", label: "Gradient Boosting" },
+  { value: "ada_boost", label: "Ada Boost" },
+  { value: "extra_trees", label: "Extra Trees" },
+  { value: "naive_bayes", label: "Naive Bayes" },
+];
+
+function renderAnalyzePanel(container, table) {
+  const cols = (table.columns || []).filter(c => !c.startsWith("@odata."));
+  const numCols = cols.filter(c => {
+    const vals = (table.rows || []).slice(0, 20).map(r => r[c]);
+    return vals.some(v => v !== null && v !== "" && !isNaN(Number(v)));
+  });
+  const catCols = cols.filter(c => !numCols.includes(c));
+
+  container.innerHTML = `
+    <div class="ml-controls">
+      <div class="ml-row">
+        <div class="ml-group">
+          <label class="ml-label">Analysis Type</label>
+          <select id="mlType" class="ml-select">
+            <option value="auto">Auto (Unsupervised)</option>
+            <option value="clean">Clean Data</option>
+            <option value="train">Train Model (Single)</option>
+            <option value="compare">Compare Algorithms</option>
+          </select>
+        </div>
+        <div class="ml-group ml-predict-opts">
+          <label class="ml-label">Algorithm</label>
+          <select id="mlAlgo" class="ml-select">
+            ${ALGO_OPTIONS.map(a => `<option value="${a.value}"${a.value === "random_forest" ? " selected" : ""}>${a.label}</option>`).join("")}
+          </select>
+        </div>
+        <div class="ml-group ml-predict-opts">
+          <label class="ml-label">Target Column</label>
+          <select id="mlTarget" class="ml-select">
+            ${cols.map(c => `<option value="${c}">${c}</option>`).join("")}
+          </select>
+        </div>
+      </div>
+      <div class="ml-row ml-clean-opts" style="display:none">
+        <div class="ml-group">
+          <label class="ml-label">Handle Missing</label>
+          <select id="mlMissing" class="ml-select">
+            <option value="drop">Drop Rows</option>
+            <option value="mean">Fill Mean</option>
+            <option value="median">Fill Median</option>
+            <option value="mode">Fill Mode</option>
+            <option value="zero">Fill Zero</option>
+          </select>
+        </div>
+        <div class="ml-group">
+          <label class="ml-label"><input type="checkbox" id="mlOutliers"> Remove Outliers</label>
+        </div>
+        <div class="ml-group">
+          <label class="ml-label"><input type="checkbox" id="mlNormalize"> Normalize</label>
+        </div>
+        <div class="ml-group">
+          <label class="ml-label"><input type="checkbox" id="mlEncode" checked> Encode Categorical</label>
+        </div>
+      </div>
+      <div class="ml-row ml-compare-opts" style="display:none">
+        <div class="ml-group">
+          <label class="ml-label">Algorithms to Compare</label>
+          <div class="ml-checkbox-group">
+            ${ALGO_OPTIONS.map(a => `<label class="ml-check"><input type="checkbox" value="${a.value}" class="ml-algo-check"${["decision_tree","random_forest","logistic_regression","xgboost","gradient_boosting"].includes(a.value) ? " checked" : ""}> ${a.label}</label>`).join("")}
+          </div>
+        </div>
+      </div>
+      <button id="mlRunBtn" class="ml-run-btn">Run Analysis</button>
+    </div>
+    <div id="mlResults" class="ml-results"></div>
+  `;
+
+  const typeSelect = container.querySelector("#mlType");
+  const predictOpts = container.querySelectorAll(".ml-predict-opts");
+  const cleanOpts = container.querySelector(".ml-clean-opts");
+  const compareOpts = container.querySelector(".ml-compare-opts");
+  const runBtn = container.querySelector("#mlRunBtn");
+  const resultsDiv = container.querySelector("#mlResults");
+
+  typeSelect.addEventListener("change", () => {
+    const v = typeSelect.value;
+    predictOpts.forEach(el => el.style.display = (v === "train") ? "" : "none");
+    cleanOpts.style.display = v === "clean" ? "" : "none";
+    compareOpts.style.display = v === "compare" ? "" : "none";
+  });
+
+  runBtn.addEventListener("click", async () => {
+    const type = typeSelect.value;
+    runBtn.disabled = true;
+    runBtn.textContent = "Running...";
+    resultsDiv.innerHTML = `<div class="analyze-loading">Processing...</div>`;
+    try {
+      let result;
+      if (type === "auto") {
+        result = await api("/analyze", { method: "POST", body: { table } });
+        resultsDiv.innerHTML = renderAnalyzeResults(result);
+      } else if (type === "clean") {
+        const opts = {
+          handle_missing: container.querySelector("#mlMissing").value,
+          remove_outliers: container.querySelector("#mlOutliers").checked,
+          normalize: container.querySelector("#mlNormalize").checked,
+          encode_categorical: container.querySelector("#mlEncode").checked,
+        };
+        result = await api("/ml/clean", { method: "POST", body: { table, options: opts } });
+        resultsDiv.innerHTML = renderCleanResults(result);
+      } else if (type === "train") {
+        const algo = container.querySelector("#mlAlgo").value;
+        const target = container.querySelector("#mlTarget").value;
+        result = await api("/ml/train", { method: "POST", body: { table, target_column: target, algorithm: algo } });
+        resultsDiv.innerHTML = renderTrainResults(result);
+      } else if (type === "compare") {
+        const target = container.querySelector("#mlTarget").value;
+        const checked = Array.from(container.querySelectorAll(".ml-algo-check:checked")).map(cb => cb.value);
+        if (checked.length === 0) throw new Error("Select at least one algorithm");
+        result = await api("/ml/train", { method: "POST", body: { table, target_column: target, compare: true, algorithms: checked } });
+        resultsDiv.innerHTML = renderTrainResults(result);
+      }
+    } catch (e) {
+      resultsDiv.innerHTML = `<div class="analyze-error">${escapeHtml(e.message)}</div>`;
+    } finally {
+      runBtn.disabled = false;
+      runBtn.textContent = "Run Analysis";
+    }
+  });
+
+  // Auto-run the default (auto) analysis
+  runBtn.click();
+}
+
 function buildResultPanel(table) {
   const analysis = analyzeTable(table);
   const panelEl = document.createElement("div");
@@ -781,18 +998,9 @@ function buildResultPanel(table) {
     analyzeView.classList.remove("hidden");
     tableView.classList.add("hidden");
     graphView.classList.add("hidden");
-    if (!analyzeLoading && !analyzeView.dataset.loaded) {
-      analyzeLoading = true;
-      analyzeView.innerHTML = `<div class="analyze-loading">Running ML analysis...</div>`;
-      api("/analyze", { method: "POST", body: { table } })
-        .then((result) => {
-          analyzeView.dataset.loaded = "1";
-          analyzeView.innerHTML = renderAnalyzeResults(result);
-        })
-        .catch((e) => {
-          analyzeView.innerHTML = `<div class="analyze-error">Analysis failed: ${escapeHtml(e.message)}</div>`;
-        })
-        .finally(() => { analyzeLoading = false; });
+    if (!analyzeView.dataset.loaded) {
+      renderAnalyzePanel(analyzeView, table);
+      analyzeView.dataset.loaded = "1";
     }
   });
   return { panelEl, tableView, renderGraph };
