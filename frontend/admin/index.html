@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admin Portal — OData Orchestration</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Login Screen -->
+  <div id="loginScreen" class="login-screen">
+    <div class="login-card">
+      <div class="login-logo">Admin Portal</div>
+      <div class="login-subtitle">OData Service Orchestration</div>
+      <form id="loginForm" class="login-form">
+        <div class="form-group">
+          <label for="loginUsername">Username</label>
+          <input type="text" id="loginUsername" placeholder="Enter username" required autocomplete="username">
+        </div>
+        <div class="form-group">
+          <label for="loginPassword">Password</label>
+          <input type="password" id="loginPassword" placeholder="Enter password" required autocomplete="current-password">
+        </div>
+        <div id="loginError" class="form-error hidden"></div>
+        <button type="submit" class="btn btn-primary btn-full" id="loginBtn">Sign In</button>
+      </form>
+      <div class="login-footer">
+        <a href="/">← Back to Landing</a>
+      </div>
+    </div>
+  </div>
+
+  <!-- Admin Shell -->
+  <div id="adminShell" class="admin-shell hidden">
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <span class="sidebar-logo">Admin</span>
+        <button class="sidebar-toggle" onclick="toggleSidebar()">☰</button>
+      </div>
+      <nav class="sidebar-nav">
+        <a href="#" class="nav-item active" data-page="dashboard" onclick="navigateTo('dashboard')">
+          <span class="nav-icon">📊</span> Dashboard
+        </a>
+        <a href="#" class="nav-item" data-page="users" onclick="navigateTo('users')">
+          <span class="nav-icon">👥</span> Users
+        </a>
+        <a href="#" class="nav-item" data-page="roles" onclick="navigateTo('roles')">
+          <span class="nav-icon">🔑</span> Roles
+        </a>
+        <a href="#" class="nav-item" data-page="services" onclick="navigateTo('services')">
+          <span class="nav-icon">🔗</span> Services
+        </a>
+        <a href="#" class="nav-item" data-page="analytics" onclick="navigateTo('analytics')">
+          <span class="nav-icon">📈</span> Analytics
+        </a>
+        <a href="#" class="nav-item" data-page="audit" onclick="navigateTo('audit')">
+          <span class="nav-icon">📋</span> Audit Log
+        </a>
+        <a href="#" class="nav-item" data-page="settings" onclick="navigateTo('settings')">
+          <span class="nav-icon">⚙️</span> Settings
+        </a>
+        <a href="/" class="nav-item">
+          <span class="nav-icon">🏠</span> Landing Page
+        </a>
+        <a href="/app/" class="nav-item">
+          <span class="nav-icon">💬</span> Chat App
+        </a>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="user-info" id="userInfo"></div>
+        <button class="btn btn-ghost btn-sm" onclick="logout()">Sign Out</button>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="main-content">
+      <header class="topbar">
+        <h1 id="pageTitle">Dashboard</h1>
+        <div class="topbar-actions">
+          <button class="theme-btn" onclick="toggleTheme()">🌓</button>
+        </div>
+      </header>
+
+      <div id="pageContent" class="page-content">
+        <!-- Dynamic content loaded here -->
+      </div>
+    </main>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast" class="toast hidden"></div>
+
+  <!-- Modal -->
+  <div id="modal" class="modal hidden">
+    <div class="modal-backdrop" onclick="closeModal()"></div>
+    <div class="modal-card" id="modalCard"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

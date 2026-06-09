@@ -60,6 +60,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Register admin/auth routes
+from app.admin.routes import router as admin_router
+app.include_router(admin_router, tags=["auth", "admin"])
+
 
 @app.get("/")
 async def root():
@@ -85,6 +89,8 @@ async def health():
 
 @app.get("/services", response_model=List[ServiceInfo])
 async def get_services():
+    if not service_manager._services:
+        await service_manager.recover_from_graph()
     return service_manager.list_services()
 
 
@@ -247,6 +253,9 @@ async def set_llm_config(payload: Dict[str, Any]):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(payload: ChatRequest):
+    if not service_manager._services:
+        await service_manager.recover_from_graph()
+
     session_id = payload.session_id
     if not session_id:
         session_id = create_session(title=payload.query[:50] or "New Chat", user_role=payload.user_role)

@@ -14,7 +14,9 @@ docker compose up -d --build
 Wait ~30s for everything to start, then open **`http://localhost:3000`**.
 
 This brings up:
-- **Frontend** (nginx) at `http://localhost:3000`
+- **Frontend** (nginx) at `http://localhost:3000` — landing page
+- **Chat App** at `http://localhost:3000/app/` — main chatbot UI
+- **Admin Portal** at `http://localhost:3000/admin/` — auth + RBAC management
 - **Backend** (FastAPI) at `http://localhost:8000` (docs at `/docs`)
 - **Neo4j** graph DB at `bolt://localhost:7687` (browser at `http://localhost:7474`)
 - **Sample OData service** at `http://localhost:5000`
@@ -35,6 +37,32 @@ To wipe all data (including Neo4j):
 ```bash
 docker compose down -v
 ```
+
+## Pages
+
+| URL | Description |
+|-----|-------------|
+| `http://localhost:3000` | Landing page — hero, features, how it works, ML algorithms, tech stack |
+| `http://localhost:3000/app/` | Chat app — NL queries, charts, ML analysis, service health |
+| `http://localhost:3000/admin/` | Admin portal — login, dashboard, users, roles, services, analytics, audit |
+| `http://localhost:8000/docs` | API documentation (Swagger) |
+| `http://localhost:7474` | Neo4j browser (neo4j/neo4j) |
+| `http://localhost:5678` | n8n workflow automation (admin/admin) |
+
+## Admin Portal
+
+Default admin credentials:
+- **Username:** `admin`
+- **Password:** `admin123!`
+
+Features:
+- **Dashboard**: user counts, service counts, recent audit activity
+- **User Management**: create/edit/delete users, assign roles, search, status toggle
+- **Role Management**: 5 default roles (super_admin, admin, analyst, user, viewer), create custom roles, granular permissions
+- **Service Management**: register/deregister OData services via URL
+- **Analytics**: query volume, action/resource/status breakdowns
+- **Audit Log**: tracks all actions with timestamps
+- **Settings**: LLM provider/model, CORS, system config
 
 ## LLM Providers
 
@@ -93,13 +121,34 @@ Results are displayed with **Table | Graph** tabs:
 - Sub-tabs (Auto/Pie/Bar/Network) for manual override
 - Insights panel with reasoning and observations
 
-### ML Analysis
+### ML Analysis (16 Algorithms)
 Click the **Analyze** tab to run ML algorithms on query results:
-- **Summary Statistics**: Mean, median, std, min/max for numeric columns
-- **Anomaly Detection**: Z-score analysis (rows with z > 2 flagged)
-- **Correlation Analysis**: Pearson correlation between numeric columns
-- **K-Means Clustering**: Groups similar rows (k=2 or k=3)
-- **Feature Importance**: Ranks columns by variance contribution
+
+**Unsupervised (5 algorithms):**
+- Summary Statistics (mean, median, std, min/max)
+- Anomaly Detection (Z-score, rows with z > 2 flagged)
+- Correlation Analysis (Pearson)
+- K-Means Clustering (k=2 or k=3)
+- Feature Importance (variance contribution)
+
+**Supervised (11 algorithms):**
+- Decision Tree, Random Forest, XGBoost, CatBoost
+- Logistic Regression, KNN, SVM
+- Gradient Boosting, Ada Boost, Extra Trees
+- Naive Bayes
+
+**Data Cleaning Pipeline:**
+- Missing values: drop, mean, median, mode, zero
+- Outlier removal: Z-score, IQR
+- Normalization: min-max, Z-score
+- Categorical encoding, deduplication
+
+### Authentication & Authorization
+- JWT tokens with httpOnly cookies
+- Password strength validation
+- Account lockout after 5 failed attempts
+- Role-based access control (5 default roles)
+- Audit logging for all admin actions
 
 ### Dark Mode
 - Toggle via sun/moon button in header
@@ -139,20 +188,30 @@ project_root/
 ├── backend/                       # FastAPI backend
 │   ├── app/
 │   │   ├── agents/                # discovery, reasoning, policy, orchestrator
+│   │   ├── auth/                  # JWT auth, password hashing, RBAC, SQLite DB
+│   │   ├── admin/                 # admin routes (users, roles, services, analytics)
 │   │   ├── db/                    # neo4j, chroma, sqlite, in-memory graph
 │   │   ├── mcp/                   # MCP tool server
 │   │   ├── schemas/               # Pydantic models
-│   │   ├── services/              # OData client, builder, sanitizer, manager, ML engine
+│   │   ├── services/              # OData client, builder, sanitizer, manager, ML engines
 │   │   ├── config.py
 │   │   └── main.py
+│   ├── data/                      # SQLite auth DB (persisted via volume)
 │   ├── scripts/seed_sample_service.py
 │   ├── requirements.txt
 │   ├── .env.example
 │   └── run.py
-├── frontend/                      # Static HTML/CSS/JS chat UI
-│   ├── index.html                 # Theme toggle, LLM selector, CDN scripts
-│   ├── styles.css                 # Dark mode, result panels, chart styles
-│   └── app.js                     # Chart renderers, ML analysis, data analyzer
+├── frontend/
+│   ├── index.html                 # Landing page (hero, features, algorithms, tech stack)
+│   ├── landing.html               # Landing page source
+│   ├── app/                       # Chat application
+│   │   ├── index.html             # Chat UI with Table|Graph|Analyze tabs
+│   │   ├── styles.css             # Dark mode, result panels, chart styles
+│   │   └── app.js                 # Chart renderers, ML analysis, data analyzer
+│   └── admin/                     # Admin portal
+│       ├── index.html             # Login + dashboard shell
+│       ├── styles.css             # Dark mode, sidebar, tables, modals
+│       └── app.js                 # Auth flow, user/role/service CRUD, analytics
 ├── sample_odata_service/          # A tiny local OData v4 service for testing
 │   ├── app.py
 │   └── requirements.txt
@@ -162,19 +221,57 @@ project_root/
 
 ## API Surface
 
+### Chat & Analysis
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/chat` | POST | Natural-language query endpoint |
+| `/analyze` | POST | Run unsupervised ML on table data |
+| `/ml/train` | POST | Train supervised ML model |
+| `/ml/clean` | POST | Run data cleaning pipeline |
+| `/ml/algorithms` | GET | List all 11 supervised algorithms |
+
+### Services
+
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/services` | GET / POST | List / register OData services |
 | `/services/{id}` | DELETE | Remove a service |
 | `/services/{id}/refresh` | POST | Re-fetch metadata |
 | `/services/health` | GET | Health check all services |
-| `/roles` | GET | List role policies |
-| `/chat` | POST | Natural-language query endpoint |
-| `/analyze` | POST | Run ML analysis on table data |
-| `/llm/config` | GET / POST | Get/set LLM provider and model |
+
+### Auth & Admin
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/auth/login` | POST | Login (returns JWT) |
+| `/auth/logout` | POST | Logout |
+| `/auth/me` | GET | Current user info |
+| `/auth/refresh` | POST | Refresh token |
+| `/admin/users` | GET / POST | List / create users |
+| `/admin/users/{id}` | PATCH / DELETE | Update / delete user |
+| `/admin/roles` | GET / POST | List / create roles |
+| `/admin/roles/{name}` | PATCH / DELETE | Update / delete role |
+| `/admin/services` | GET / POST | List / register services |
+| `/admin/services/{id}` | DELETE | Deregister service |
+| `/admin/analytics` | GET | Query volume + breakdowns |
+| `/admin/audit` | GET | Audit log |
+| `/admin/settings` | GET / PATCH | System settings |
+| `/admin/dashboard` | GET | Dashboard summary |
+
+### LLM & Sessions
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/llm/config` | GET / POST | Get / set LLM provider and model |
 | `/sessions` | GET / POST | Chat sessions |
 | `/sessions/{id}` | PATCH / DELETE | Rename / delete a session |
 | `/sessions/{id}/messages` | GET | Message history |
+
+### MCP
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
 | `/mcp/tools` | GET | List MCP-style tools |
 | `/mcp/call` | POST | Call an MCP-style tool |
 

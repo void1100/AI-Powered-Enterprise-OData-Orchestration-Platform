@@ -66,12 +66,13 @@ services:
       - "8000:8000"
     volumes:
       - backend_data:/app/data
+      - chroma_cache:/root/.cache/chroma
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
       interval: 30s
-      timeout: 5s
-      start_period: 20s
-      retries: 3
+      timeout: 10s
+      start_period: 120s
+      retries: 5
 
   seeder:
     build:
@@ -97,6 +98,7 @@ services:
       NORTHWIND_URL: https://services.odata.org/V4/Northwind/Northwind.svc
     volumes:
       - backend_data:/app/data
+      - chroma_cache:/root/.cache/chroma
     entrypoint: ["python", "-m", "scripts.seed_sample_service"]
     restart: "no"
 
@@ -147,4 +149,5 @@ services:
 volumes:
   neo4j_data:
   backend_data:
+  chroma_cache:
   n8n_data:
