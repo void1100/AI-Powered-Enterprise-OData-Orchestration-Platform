@@ -648,6 +648,103 @@ function renderTrainResults(result) {
   return html;
 }
 
+function generateSupervisedInsights(res) {
+  const insights = [];
+  const target = res.target_column;
+  const fi = res.feature_importance || [];
+  const m = res.metrics;
+  const task = res.task_type;
+  const samples = res.sample_count;
+
+  if (fi.length > 0) {
+    const top = fi[0];
+    const topPct = (top.importance * 100).toFixed(1);
+    const topCol = top.column;
+
+    if (top.importance > 0.5) {
+      insights.push(`<strong>${topCol}</strong> is the dominant predictor of <strong>${target}</strong> (${topPct}% importance), meaning it has the strongest influence on the outcome.`);
+    } else if (top.importance > 0.2) {
+      insights.push(`<strong>${topCol}</strong> is the most important factor for predicting <strong>${target}</strong> (${topPct}% importance).`);
+    } else {
+      insights.push(`No single feature strongly predicts <strong>${target}</strong>. The model relies on a combination of factors.`);
+    }
+
+    if (fi.length >= 2) {
+      const second = fi[1];
+      const secondPct = (second.importance * 100).toFixed(1);
+      if (second.importance > 0.15) {
+        insights.push(`<strong>${second.column}</strong> is also significant (${secondPct}% importance).`);
+      }
+    }
+
+    const lowFeatures = fi.filter(f => f.importance < 0.05);
+    if (lowFeatures.length > 0) {
+      const names = lowFeatures.map(f => `<strong>${f.column}</strong>`).join(", ");
+      insights.push(`${names} have minimal impact on the prediction and could be removed without losing accuracy.`);
+    }
+  }
+
+  if (task === "regression") {
+    const r2 = parseFloat(m.r2);
+    if (r2 > 0.85) {
+      insights.push(`The model explains <strong>${(r2 * 100).toFixed(0)}%</strong> of the variance — excellent fit.`);
+    } else if (r2 > 0.6) {
+      insights.push(`The model explains <strong>${(r2 * 100).toFixed(0)}%</strong> of the variance — good fit but could be improved.`);
+    } else if (r2 > 0.3) {
+      insights.push(`The model explains only <strong>${(r2 * 100).toFixed(0)}%</strong> of the variance — moderate fit. Consider adding more features.`);
+    } else {
+      insights.push(`The model explains only <strong>${(r2 * 100).toFixed(0)}%</strong> of the variance — weak fit. The data may need more features or a different approach.`);
+    }
+
+    const mae = parseFloat(m.mae);
+    if (mae < 0.05) {
+      insights.push(`Average prediction error is very low (${mae}) — predictions are highly accurate.`);
+    } else if (mae < 0.15) {
+      insights.push(`Average prediction error is ${mae} — predictions are reasonably accurate.`);
+    } else {
+      insights.push(`Average prediction error is ${mae} — predictions have notable uncertainty.`);
+    }
+
+    if (fi.length > 0) {
+      const topCol = fi[0].column;
+      insights.push(`Higher values of <strong>${topCol}</strong> tend to correlate with <strong>${target}</strong>.`);
+    }
+  }
+
+  if (task === "classification") {
+    const acc = parseFloat(m.accuracy);
+    if (acc > 0.9) {
+      insights.push(`The model achieves <strong>${(acc * 100).toFixed(0)}%</strong> accuracy — excellent classification performance.`);
+    } else if (acc > 0.75) {
+      insights.push(`The model achieves <strong>${(acc * 100).toFixed(0)}%</strong> accuracy — good but room for improvement.`);
+    } else if (acc > 0.6) {
+      insights.push(`The model achieves <strong>${(acc * 100).toFixed(0)}%</strong> accuracy — moderate. Consider more data or better features.`);
+    } else {
+      insights.push(`The model achieves only <strong>${(acc * 100).toFixed(0)}%</strong> accuracy — weak performance. The features may not be sufficient for this classification.`);
+    }
+
+    const f1 = parseFloat(m.f1);
+    if (f1 > 0.85) {
+      insights.push(`F1 score of <strong>${f1}</strong> indicates strong precision-recall balance.`);
+    } else if (f1 < 0.5) {
+      insights.push(`F1 score of <strong>${f1}</strong> is low — the model struggles to balance false positives and false negatives.`);
+    }
+
+    if (fi.length > 0) {
+      const topCol = fi[0].column;
+      insights.push(`Products with higher <strong>${topCol}</strong> values are more likely to be classified as <strong>${target}</strong>.`);
+    }
+  }
+
+  if (samples < 30) {
+    insights.push(`⚠️ Only <strong>${samples}</strong> training samples — results may not generalize well. More data would improve reliability.`);
+  } else if (samples < 100) {
+    insights.push(`Training on <strong>${samples}</strong> samples — reasonable for initial analysis but more data would help.`);
+  }
+
+  return insights;
+}
+
 const ALGO_NAMES = { decision_tree:"Decision Tree", random_forest:"Random Forest", xgboost:"XGBoost", catboost:"CatBoost", logistic_regression:"Logistic Regression", knn:"K-Nearest Neighbors", svm:"Support Vector Machine", gradient_boosting:"Gradient Boosting", ada_boost:"Ada Boost", extra_trees:"Extra Trees", naive_bayes:"Naive Bayes" };
 
 function renderSingleTrainResult(algo, res, isBest) {
@@ -659,8 +756,15 @@ function renderSingleTrainResult(algo, res, isBest) {
   } else {
     html += `<div class="metrics-row"><div class="metric"><span class="metric-val">${m.r2}</span><span class="metric-lbl">R²</span></div><div class="metric"><span class="metric-val">${m.mae}</span><span class="metric-lbl">MAE</span></div><div class="metric"><span class="metric-val">${m.rmse}</span><span class="metric-lbl">RMSE</span></div></div>`;
   }
-  if (res.confusion_matrix) {
-    html += `<div class="analyze-subtitle">Confusion Matrix</div>`;
+  const insights = generateSupervisedInsights(res);
+  if (insights.length > 0) {
+    html += `<div class="analyze-subtitle">Business Insights</div><div class="insights-list">`;
+    for (const ins of insights) {
+      html += `<div class="insight-item">${ins}</div>`;
+    }
+    html += `</div>`;
+  }
+  if (res.confusion_matrix) {    html += `<div class="analyze-subtitle">Confusion Matrix</div>`;
     const labels = res.confusion_matrix_labels || [];
     html += `<div class="cm-wrap"><table class="cm-table"><thead><tr><th></th>`;
     for (const l of labels) html += `<th>${escapeHtml(String(l))}</th>`;

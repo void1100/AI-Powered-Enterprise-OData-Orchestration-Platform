@@ -314,6 +314,9 @@ body { color-scheme: var(--color-scheme); }
 .best-algo { border-color: var(--success) !important; box-shadow: 0 0 0 1px var(--success); }
 .best-badge { display: inline-block; padding: 1px 6px; border-radius: 4px; background: var(--success); color: #fff; font-size: 9px; font-weight: 700; text-transform: uppercase; vertical-align: middle; margin-left: 6px; }
 .analyze-subtitle { font-size: 12px; font-weight: 600; color: var(--text); margin: 12px 0 6px; }
+.insights-list { display: flex; flex-direction: column; gap: 8px; margin: 8px 0 12px; }
+.insight-item { padding: 10px 14px; background: var(--bg-elev); border-left: 3px solid #3b82f6; border-radius: 0 8px 8px 0; font-size: 13px; line-height: 1.5; color: var(--text); }
+.insight-item strong { color: #60a5fa; }
 .cm-wrap { overflow-x: auto; }
 .cm-table { border-collapse: collapse; font-size: 11px; }
 .cm-table th, .cm-table td { padding: 6px 10px; border: 1px solid var(--border); text-align: center; }
