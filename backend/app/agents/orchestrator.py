@@ -151,6 +151,50 @@ class Orchestrator:
         error_message: Optional[str] = None
         corrected_step_indices: List[int] = []
 
+        # Handle prediction intent
+        if plan.get("intent") == "predict" and plan.get("prediction"):
+            pred = plan["prediction"]
+            entity_key = pred.get("entity_key", "")
+            features = pred.get("features", {})
+            target = pred.get("target", "")
+            from app.services.model_store import model_store
+            prediction_result = model_store.predict(entity_key, features)
+            if prediction_result:
+                tool_calls.append({
+                    "type": "prediction",
+                    "entity_key": entity_key,
+                    "target": target,
+                    "features": features,
+                    "prediction": prediction_result["prediction"],
+                    "confidence": prediction_result["confidence_info"],
+                })
+                summary = (
+                    f"Predicted **{target}** = **{prediction_result['prediction']}** "
+                    f"based on {features}. "
+                    f"{prediction_result['confidence_info']}"
+                )
+                return {
+                    "run_id": run_id,
+                    "session_id": session_id,
+                    "user_query": user_query,
+                    "user_role": user_role,
+                    "summary": summary,
+                    "plan": plan,
+                    "discovery": discovery,
+                    "tool_calls": tool_calls,
+                    "blocked_steps": [],
+                    "table": None,
+                    "primary_url": None,
+                    "primary_service": None,
+                    "error": None,
+                    "memory_used": memory,
+                    "llm_provider": llm_provider,
+                    "llm_latency_ms": llm_latency_ms,
+                    "llm_tokens": llm_tokens,
+                }
+            else:
+                error_message = f"No trained model available for '{entity_key}'. Query the data first to enable predictions."
+
         for idx, step in enumerate(plan.get("steps", [])):
             sid = step.get("service_id")
             ent = step.get("entity_set")

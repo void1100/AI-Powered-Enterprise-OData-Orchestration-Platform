@@ -2,6 +2,8 @@ import os
 import sys
 import asyncio
 import time
+import uuid
+import re
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List
 
@@ -263,6 +265,73 @@ async def chat(payload: ChatRequest):
         touch_session(session_id)
 
     add_message(session_id, "user", payload.query)
+
+    # Direct prediction detection (bypass LLM for prediction queries)
+    from app.services.model_store import model_store
+    query_lower = payload.query.lower()
+    prediction_keywords = ["predict", "what will", "forecast", "estimate", "project"]
+    is_prediction = any(kw in query_lower for kw in prediction_keywords) and ("if" in query_lower or "given" in query_lower or "when" in query_lower)
+    
+    if is_prediction:
+        models = model_store.list_models()
+        if models:
+            # Find best matching model
+            best_model = None
+            for m in models:
+                ek = m["entity_key"].lower()
+                if any(word in query_lower for word in ek.split("_")):
+                    best_model = m
+                    break
+            if not best_model:
+                best_model = models[0]
+            
+            # Extract feature values from query (simple heuristic)
+            features = {}
+            import re
+            for m in models:
+                for feat in m.get("feature_columns", []):
+                    # Match patterns like "CategoryID is 2", "CategoryID = 2", "CategoryID 2"
+                    pattern = rf'{re.escape(feat)}\s*(?:is|=|equals)?\s*(\d+\.?\d*)'
+                    match = re.search(pattern, payload.query, re.IGNORECASE)
+                    if match:
+                        features[feat] = float(match.group(1))
+            
+            pred_result = model_store.predict(best_model["entity_key"], features)
+            if pred_result:
+                tool_calls = [{
+                    "type": "prediction",
+                    "entity_key": best_model["entity_key"],
+                    "target": pred_result["target_column"],
+                    "prediction": pred_result["prediction"],
+                    "confidence": pred_result["confidence_info"],
+                    "features": pred_result["features_used"],
+                }]
+                summary = (
+                    f"Predicted **{pred_result['target_column']}** = **{pred_result['prediction']:.2f}** "
+                    f"based on {pred_result['features_used']}. "
+                    f"{pred_result['confidence_info']}. "
+                    f"*(Model: {best_model['algorithm']}, trained on {best_model['sample_count']} samples)*"
+                )
+                return ChatResponse(
+                    run_id=str(uuid.uuid4()),
+                    session_id=session_id,
+                    user_query=payload.query,
+                    user_role=payload.user_role,
+                    summary=summary,
+                    plan={"intent": "predict", "prediction": pred_result},
+                    discovery=None,
+                    tool_calls=tool_calls,
+                    blocked_steps=[],
+                    table=None,
+                    primary_url=None,
+                    primary_service=None,
+                    error=None,
+                    memory_used=[],
+                    llm_provider="model_store",
+                    llm_latency_ms=0,
+                    llm_tokens=0,
+                )
+
     result = await orchestrator.run(
         user_query=payload.query,
         session_id=session_id,
@@ -305,6 +374,41 @@ async def chat(payload: ChatRequest):
         except Exception as e:
             logger.warning(f"Table validation failed: {e}")
             table_obj = None
+
+    # Auto-train model on query results for prediction capability
+    if result.get("table") and result["table"].get("rows") and len(result["table"]["rows"]) >= 5:
+        try:
+            from app.services.model_store import model_store
+            from app.services.ml_supervised import train_model
+            table_data = result["table"]
+            cols = table_data["columns"]
+            rows = table_data["rows"]
+            numeric_cols = [c for c in cols if not c.startswith("@odata.") and c != "odata.etag"]
+            # Find best numeric target for regression
+            for col in reversed(numeric_cols):
+                try:
+                    vals = [float(r[col]) for r in rows if r.get(col) is not None]
+                    if len(vals) >= 5 and len(set(vals)) > 1:
+                        entity_key = f"{result.get('primary_service', 'unknown')}_{result.get('plan', {}).get('steps', [{}])[0].get('entity_set', 'data')}"
+                        train_result = train_model(rows, cols, col, "random_forest")
+                        if "_model" in train_result:
+                            model_store.store(
+                                entity_key=entity_key,
+                                model_obj=train_result["_model"],
+                                feature_columns=train_result["feature_columns"],
+                                target_column=col,
+                                task_type=train_result["task_type"],
+                                metrics=train_result["metrics"],
+                                feature_importance=train_result.get("feature_importance", []),
+                                algorithm="random_forest",
+                                sample_count=train_result["sample_count"],
+                            )
+                            logger.info(f"Auto-trained model for {entity_key} targeting {col}")
+                        break
+                except (ValueError, TypeError):
+                    continue
+        except Exception as e:
+            logger.warning(f"Auto-training failed: {e}")
 
     return ChatResponse(
         run_id=result["run_id"],
@@ -404,10 +508,27 @@ async def ml_train(payload: Dict[str, Any]):
     from app.services.ml_supervised import train_model, train_and_compare
     try:
         if compare:
-            algorithms = payload.get("algorithms", ["decision_tree", "random_forest", "logistic_regression", "xgboost", "gradient_boosting"])
+            algorithms = payload.get("algorithms", ["decision_tree", "random_forest", "linear_regression", "logistic_regression", "xgboost", "gradient_boosting"])
             result = train_and_compare(table["rows"], table["columns"], target_col, algorithms)
         else:
             result = train_model(table["rows"], table["columns"], target_col, algorithm, options)
+        # Remove non-serializable model object before returning
+        model_obj = result.pop("_model", None)
+        # Store model for prediction if single algorithm
+        if model_obj and not compare:
+            from app.services.model_store import model_store
+            entity_key = f"manual_{target_col}"
+            model_store.store(
+                entity_key=entity_key,
+                model_obj=model_obj,
+                feature_columns=result.get("feature_columns", []),
+                target_column=target_col,
+                task_type=result.get("task_type", "regression"),
+                metrics=result.get("metrics", {}),
+                feature_importance=result.get("feature_importance", []),
+                algorithm=algorithm,
+                sample_count=result.get("sample_count", 0),
+            )
         return result
     except Exception as e:
         logger.error(f"ML training failed: {e}")
@@ -418,6 +539,128 @@ async def ml_train(payload: Dict[str, Any]):
 async def ml_algorithms():
     from app.services.ml_supervised import ALGORITHMS
     return {"algorithms": ALGORITHMS}
+
+
+@app.get("/ml/models")
+async def ml_models():
+    from app.services.model_store import model_store
+    return {"models": model_store.list_models()}
+
+
+@app.post("/ml/predict")
+async def ml_predict(payload: Dict[str, Any]):
+    from app.services.model_store import model_store
+    entity_key = payload.get("entity_key")
+    features = payload.get("features", {})
+    if not entity_key:
+        raise HTTPException(status_code=400, detail="entity_key required")
+    result = model_store.predict(entity_key, features)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"No trained model for '{entity_key}'. Query the data first to train a model.")
+    return result
+
+
+@app.post("/odata/paginate")
+async def odata_paginate(payload: Dict[str, Any]):
+    """Initialize pagination for a large dataset query."""
+    from app.services.pagination import pagination_manager
+    import httpx
+    
+    url = payload.get("url")
+    session_id = payload.get("session_id")
+    page_size = payload.get("page_size", 50)
+    
+    if not url or not session_id:
+        raise HTTPException(status_code=400, detail="url and session_id required")
+    
+    try:
+        # Fetch with $count to get total
+        count_url = url + ("&" if "?" in url else "?") + "$count=true&$top=0"
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            resp = await client.get(count_url)
+            resp.raise_for_status()
+            data = resp.json()
+            total_count = data.get("@odata.count", 0)
+        
+        # Create pagination session
+        pagination_info = pagination_manager.create_session(
+            session_id=session_id,
+            base_url=url,
+            total_count=total_count,
+            page_size=page_size
+        )
+        
+        # Fetch first page
+        skip, top = pagination_manager.get_skip_top(session_id)
+        page_url = url + ("&" if "?" in url else "?") + f"$skip={skip}&$top={top}"
+        
+        from app.services.response_sanitizer import sanitize
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            resp = await client.get(page_url)
+            resp.raise_for_status()
+            raw = resp.json()
+        
+        sanitized = sanitize(raw, max_rows=top)
+        
+        return {
+            "pagination": pagination_info,
+            "table": sanitized
+        }
+    except Exception as e:
+        logger.error(f"Pagination init failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/odata/page")
+async def odata_page(payload: Dict[str, Any]):
+    """Get next/previous page of paginated data."""
+    from app.services.pagination import pagination_manager
+    import httpx
+    
+    session_id = payload.get("session_id")
+    action = payload.get("action", "next")  # next, prev, goto
+    page = payload.get("page", 1)
+    
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id required")
+    
+    state = pagination_manager.get_session(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Pagination session not found. Query again to start pagination.")
+    
+    # Update pagination state
+    if action == "next":
+        pagination_info = pagination_manager.next_page(session_id)
+    elif action == "prev":
+        pagination_info = pagination_manager.prev_page(session_id)
+    elif action == "goto":
+        pagination_info = pagination_manager.goto_page(session_id, page)
+    else:
+        raise HTTPException(status_code=400, detail="action must be next, prev, or goto")
+    
+    if not pagination_info:
+        raise HTTPException(status_code=400, detail="No more pages available")
+    
+    try:
+        # Fetch the page data
+        skip, top = pagination_manager.get_skip_top(session_id)
+        page_url = state.base_url + ("&" if "?" in state.base_url else "?") + f"$skip={skip}&$top={top}"
+        
+        from app.services.response_sanitizer import sanitize
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            resp = await client.get(page_url)
+            resp.raise_for_status()
+            raw = resp.json()
+        
+        sanitized = sanitize(raw, max_rows=top)
+        
+        return {
+            "pagination": pagination_info,
+            "table": sanitized
+        }
+    except Exception as e:
+        logger.error(f"Pagination page failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/mcp/tools")

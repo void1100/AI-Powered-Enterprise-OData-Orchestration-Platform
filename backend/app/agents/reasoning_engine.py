@@ -379,7 +379,15 @@ class LLMReasoningEngine:
             "intent, target_services, steps (each with service_id, entity_set, select, filter, expand, orderby, top, skip), "
             "and summary. Use only services and entity sets provided. "
             "IMPORTANT: Do NOT use navigation properties (e.g. 'Category/Name') in $filter. "
-            "Use the foreign key field directly (e.g. 'CategoryID eq 1')."
+            "Use the foreign key field directly (e.g. 'CategoryID eq 1'). "
+            "COLUMN SELECTION: Always include ID and Name columns in $select when available. "
+            "For Products include ProductID, ProductName. For Customers include CustomerID, CompanyName. "
+            "For Orders include OrderID. For Employees include EmployeeID, FirstName, LastName. "
+            "Never select only numeric columns - always include the primary key and name. "
+            "PREDICTION: If the user asks 'what will X be if Y is Z' or 'predict X given Y', "
+            "set intent to 'predict' and add a 'prediction' object to the plan with: "
+            "entity_key (service_entity), features (dict of known values), target (the column to predict). "
+            "Do NOT create steps for prediction queries - only use the prediction object."
         )
         user_prompt = json.dumps({
             "query": query,
@@ -431,7 +439,15 @@ class LLMReasoningEngine:
             "intent, target_services, steps (each with service_id, entity_set, select, filter, expand, orderby, top, skip), "
             "and summary. Use only services and entity sets provided. "
             "IMPORTANT: Do NOT use navigation properties (e.g. 'Category/Name') in $filter. "
-            "Use the foreign key field directly (e.g. 'CategoryID eq 1')."
+            "Use the foreign key field directly (e.g. 'CategoryID eq 1'). "
+            "COLUMN SELECTION: Always include ID and Name columns in $select when available. "
+            "For Products include ProductID, ProductName. For Customers include CustomerID, CompanyName. "
+            "For Orders include OrderID. For Employees include EmployeeID, FirstName, LastName. "
+            "Never select only numeric columns - always include the primary key and name. "
+            "PREDICTION: If the user asks 'what will X be if Y is Z' or 'predict X given Y', "
+            "set intent to 'predict' and add a 'prediction' object to the plan with: "
+            "entity_key (service_entity), features (dict of known values), target (the column to predict). "
+            "Do NOT create steps for prediction queries - only use the prediction object."
         )
         user_prompt = json.dumps({
             "query": query,

@@ -60,6 +60,7 @@ ALGORITHMS = {
     "xgboost": "XGBoost",
     "catboost": "CatBoost",
     "logistic_regression": "Logistic Regression",
+    "linear_regression": "Linear Regression",
     "knn": "K-Nearest Neighbors",
     "svm": "Support Vector Machine",
     "gradient_boosting": "Gradient Boosting",
@@ -86,6 +87,10 @@ def get_algorithm(name: str):
     elif name == "logistic_regression":
         from sklearn.linear_model import LogisticRegression
         return LogisticRegression, LogisticRegression
+    elif name == "linear_regression":
+        from sklearn.linear_model import LinearRegression
+        from sklearn.linear_model import LinearRegression as LinearRegressionCls
+        return LinearRegressionCls, LinearRegression
     elif name == "knn":
         from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
         return KNeighborsClassifier, KNeighborsRegressor
@@ -144,7 +149,8 @@ def _detect_task_type(y: np.ndarray) -> str:
     if y.dtype.kind in ('U', 'S', 'O'):
         return "classification"
     unique = np.unique(y[~np.isnan(y)] if y.dtype == float else y)
-    if len(unique) <= 20:
+    # Only treat as classification if very few unique integer values (like Yes/No, 0/1/2)
+    if len(unique) <= 5:
         if all(isinstance(v, (int, np.integer)) or (isinstance(v, float) and v == int(v)) for v in unique):
             return "classification"
     return "regression"
@@ -278,7 +284,7 @@ def train_model(
     if task_type == "classification" and target_mapping:
         cm_labels = [k for k, v in sorted(target_mapping.items(), key=lambda x: x[1])]
 
-    return _sanitize({
+    result = _sanitize({
         "algorithm": ALGORITHMS.get(algorithm, algorithm),
         "algorithm_key": algorithm,
         "task_type": task_type,
@@ -292,6 +298,9 @@ def train_model(
         "sample_count": len(X),
         "target_column": target_col,
     })
+    # Store model separately (not JSON serializable)
+    result["_model"] = model
+    return result
 
 
 def train_and_compare(
@@ -302,7 +311,7 @@ def train_and_compare(
 ) -> Dict[str, Any]:
     """Train multiple algorithms and compare results."""
     if not algorithms:
-        algorithms = ["decision_tree", "random_forest", "logistic_regression"]
+        algorithms = ["decision_tree", "random_forest", "linear_regression", "logistic_regression"]
 
     results = {}
     for algo in algorithms:

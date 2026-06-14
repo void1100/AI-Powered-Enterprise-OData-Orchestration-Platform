@@ -4,6 +4,9 @@ from typing import Any, Dict, List
 
 SENSITIVE_KEYS = {"password", "pwd", "secret", "token", "apikey", "api_key", "authorization", "creditcard", "ssn"}
 
+# Columns to exclude from output (OData metadata)
+EXCLUDE_COLUMNS = {"@odata.etag", "odata.etag"}
+
 
 def _scrub(value: Any) -> Any:
     if isinstance(value, dict):
@@ -29,11 +32,18 @@ def sanitize(odata_payload: Dict[str, Any], max_rows: int = 50) -> Dict[str, Any
     for r in truncated:
         if isinstance(r, dict):
             for k in r.keys():
-                if k not in columns:
+                if k not in columns and k not in EXCLUDE_COLUMNS:
                     columns.append(k)
+    # Remove excluded columns from rows
+    cleaned_rows = []
+    for r in truncated:
+        if isinstance(r, dict):
+            cleaned_rows.append({k: v for k, v in r.items() if k not in EXCLUDE_COLUMNS})
+        else:
+            cleaned_rows.append(r)
     return {
         "columns": columns,
-        "rows": truncated,
+        "rows": cleaned_rows,
         "row_count": len(rows),
         "truncated": len(rows) > max_rows,
         "total_count": scrubbed.get("@odata.count") if isinstance(scrubbed, dict) else None,

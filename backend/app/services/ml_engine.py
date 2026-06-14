@@ -177,6 +177,39 @@ def analyze_table(table: Dict[str, Any]) -> Dict[str, Any]:
                 "centroid": {numeric_cols[j]: round(float(centroids[i, j]), 4) for j in range(len(numeric_cols))},
                 "sample_rows": member_rows[:3],
             }
+        
+        # PCA projection for 2D visualization
+        scatter_data = None
+        if matrix.shape[1] >= 2:
+            try:
+                from sklearn.decomposition import PCA
+                pca = PCA(n_components=2)
+                projected = pca.fit_transform(matrix)
+                centroid_projected = pca.transform(centroids)
+                scatter_data = {
+                    "points": [
+                        {
+                            "x": round(float(projected[j, 0]), 4),
+                            "y": round(float(projected[j, 1]), 4),
+                            "cluster": int(labels[j]),
+                        }
+                        for j in range(len(rows))
+                    ],
+                    "centroids": [
+                        {
+                            "x": round(float(centroid_projected[i, 0]), 4),
+                            "y": round(float(centroid_projected[i, 1]), 4),
+                            "cluster": i,
+                        }
+                        for i in range(k)
+                    ],
+                    "variance_explained": round(float(sum(pca.explained_variance_ratio_)), 4),
+                    "x_label": f"PC1 ({round(float(pca.explained_variance_ratio_[0]), 2)*100}%)",
+                    "y_label": f"PC2 ({round(float(pca.explained_variance_ratio_[1]), 2)*100}%)",
+                }
+            except Exception:
+                pass
+        
         results["algorithms"]["clustering"] = {
             "description": f"K-Means clustering into {k} groups based on numeric features",
             "method": "K-Means",
@@ -184,6 +217,7 @@ def analyze_table(table: Dict[str, Any]) -> Dict[str, Any]:
             "iterations_converged": True,
             "clusters": clusters,
             "labels": [int(l) for l in labels],
+            "scatter_data": scatter_data,
         }
 
     if matrix.size > 0 and len(numeric_cols) >= 2:

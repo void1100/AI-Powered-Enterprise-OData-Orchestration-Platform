@@ -15,6 +15,8 @@ const API_BASE = (() => {
 
 let currentSessionId = null;
 let isLoading = false;
+let currentPaginationSession = null;
+let currentTableData = null;
 
 const $ = (id) => document.getElementById(id);
 const messagesEl = $("messages");
@@ -139,7 +141,7 @@ function addUserBubble(text, scroll = true) {
   if (scroll) messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
-function addAssistantBubble(summary, result, scroll = true) {
+function addAssistantBubble(summary, result, scroll = true, paginationInfo = null) {
   const div = document.createElement("div");
   div.className = "bubble assistant";
   div.textContent = summary || "Done.";
@@ -154,7 +156,7 @@ function addAssistantBubble(summary, result, scroll = true) {
     div.appendChild(badge);
   }
   if (result && result.table) {
-    const tableWrap = renderTable(result.table);
+    const tableWrap = renderTable(result.table, paginationInfo);
     if (tableWrap) {
       const panel = buildResultPanel(result.table);
       div.appendChild(panel.panelEl);
@@ -170,6 +172,9 @@ function addAssistantBubble(summary, result, scroll = true) {
       if (t.type === "odata.query") {
         const correctedTag = t.corrected ? ` <span class="tool-pill corrected">corrected</span>` : "";
         return `<span class="tool-pill">${escapeHtml(t.service_id)}/${escapeHtml(t.entity_set)}</span> ${t.row_count} rows${correctedTag}<div class="url-line">${escapeHtml(t.url || "")}</div>`;
+      }
+      if (t.type === "prediction") {
+        return `<span class="tool-pill" style="background:#3b82f6;color:white">prediction</span> <strong>${escapeHtml(t.target)}</strong> = <strong>${escapeHtml(String(t.prediction))}</strong> <span style="opacity:0.6">${escapeHtml(t.confidence || "")}</span><div class="url-line">Features: ${escapeHtml(JSON.stringify(t.features || {}))}</div>`;
       }
       return `<span class="tool-pill">error</span> ${escapeHtml(t.error || "")}`;
     }).join("");
@@ -205,7 +210,7 @@ function downloadCsv(table, label) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-function renderTable(table) {
+function renderTable(table, paginationInfo = null) {
   if (!table || !table.columns || !table.rows || !table.rows.length) return null;
   const wrap = document.createElement("div");
   wrap.className = "table-wrapper";
@@ -241,13 +246,73 @@ function renderTable(table) {
   });
   tableEl.appendChild(tbody);
   wrap.appendChild(tableEl);
-  if (table.truncated || table.row_count > table.rows.length) {
+  
+  // Pagination controls
+  if (paginationInfo && paginationInfo.total_count > paginationInfo.page_size) {
+    const paginationDiv = document.createElement("div");
+    paginationDiv.className = "pagination-controls";
+    
+    const info = document.createElement("span");
+    info.className = "pagination-info";
+    info.textContent = `Page ${paginationInfo.current_page} of ${paginationInfo.total_pages} (${paginationInfo.total_count} total rows)`;
+    paginationDiv.appendChild(info);
+    
+    const buttons = document.createElement("div");
+    buttons.className = "pagination-buttons";
+    
+    const prevBtn = document.createElement("button");
+    prevBtn.className = "pagination-btn";
+    prevBtn.textContent = "← Previous";
+    prevBtn.disabled = !paginationInfo.has_prev;
+    prevBtn.addEventListener("click", () => loadPage("prev"));
+    buttons.appendChild(prevBtn);
+    
+    const nextBtn = document.createElement("button");
+    nextBtn.className = "pagination-btn";
+    nextBtn.textContent = "Next →";
+    nextBtn.disabled = !paginationInfo.has_next;
+    nextBtn.addEventListener("click", () => loadPage("next"));
+    buttons.appendChild(nextBtn);
+    
+    paginationDiv.appendChild(buttons);
+    wrap.appendChild(paginationDiv);
+    
+    // Store pagination state for this table
+    wrap.dataset.paginationSession = currentPaginationSession;
+  } else if (table.truncated || table.row_count > table.rows.length) {
     const note = document.createElement("div");
     note.className = "url-line";
     note.textContent = `Showing ${table.rows.length} of ${table.row_count} rows${table.total_count ? ` (total: ${table.total_count})` : ""}.`;
     wrap.appendChild(note);
   }
   return wrap;
+}
+
+async function loadPage(action, page = 1) {
+  if (!currentPaginationSession) return;
+  
+  try {
+    const result = await api("/odata/page", {
+      method: "POST",
+      body: { session_id: currentPaginationSession, action, page }
+    });
+    
+    currentTableData = result.table;
+    
+    // Update the current table in the UI
+    const lastBubble = messagesEl.querySelector(".bubble.assistant:last-child");
+    if (lastBubble) {
+      const tableWrapper = lastBubble.querySelector(".table-wrapper");
+      if (tableWrapper) {
+        const newTableWrap = renderTable(result.table, result.pagination);
+        if (newTableWrap) {
+          tableWrapper.parentNode.replaceChild(newTableWrap, tableWrapper);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Pagination error:", err);
+  }
 }
 
 function escapeHtml(s) {
@@ -558,6 +623,161 @@ function renderNetworkGraph(container, data, isDark) {
 
 const resultPanels = new Set();
 
+const CLUSTER_COLORS = ["#8b5cf6", "#06b6d4", "#eab308", "#ef4444", "#22c55e", "#f97316", "#ec4899"];
+
+function renderScatterPlot(canvasId, scatterData) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas || !scatterData || !scatterData.points || scatterData.points.length === 0) return;
+  
+  const ctx = canvas.getContext("2d");
+  const width = canvas.width;
+  const height = canvas.height;
+  const padding = 50;
+  
+  // Clear canvas
+  ctx.fillStyle = "#1e1e2e";
+  ctx.fillRect(0, 0, width, height);
+  
+  const points = scatterData.points;
+  const centroids = scatterData.centroids || [];
+  
+  // Find bounds
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const p of points) {
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  }
+  
+  // Add padding to bounds
+  const xRange = maxX - minX || 1;
+  const yRange = maxY - minY || 1;
+  minX -= xRange * 0.1;
+  maxX += xRange * 0.1;
+  minY -= yRange * 0.1;
+  maxY += yRange * 0.1;
+  
+  // Scale functions
+  const scaleX = (v) => padding + ((v - minX) / (maxX - minX)) * (width - 2 * padding);
+  const scaleY = (v) => height - padding - ((v - minY) / (maxY - minY)) * (height - 2 * padding);
+  
+  // Draw grid lines
+  ctx.strokeStyle = "#333355";
+  ctx.lineWidth = 0.5;
+  for (let i = 0; i <= 4; i++) {
+    const x = padding + (i / 4) * (width - 2 * padding);
+    const y = padding + (i / 4) * (height - 2 * padding);
+    ctx.beginPath();
+    ctx.moveTo(x, padding);
+    ctx.lineTo(x, height - padding);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(padding, y);
+    ctx.lineTo(width - padding, y);
+    ctx.stroke();
+  }
+  
+  // Draw axes border
+  ctx.strokeStyle = "#555577";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(padding, padding);
+  ctx.lineTo(padding, height - padding);
+  ctx.lineTo(width - padding, height - padding);
+  ctx.stroke();
+  
+  // Draw axis labels
+  ctx.fillStyle = "#aaaacc";
+  ctx.font = "11px 'Inter', sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(scatterData.x_label || "PC1", width / 2, height - 10);
+  ctx.save();
+  ctx.translate(15, height / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText(scatterData.y_label || "PC2", 0, 0);
+  ctx.restore();
+  
+  // Draw tick labels
+  ctx.fillStyle = "#888899";
+  ctx.font = "9px 'JetBrains Mono', monospace";
+  ctx.textAlign = "center";
+  for (let i = 0; i <= 4; i++) {
+    const val = minX + (i / 4) * (maxX - minX);
+    const x = padding + (i / 4) * (width - 2 * padding);
+    ctx.fillText(val.toFixed(1), x, height - padding + 15);
+  }
+  ctx.textAlign = "right";
+  for (let i = 0; i <= 4; i++) {
+    const val = minY + (i / 4) * (maxY - minY);
+    const y = height - padding - (i / 4) * (height - 2 * padding);
+    ctx.fillText(val.toFixed(1), padding - 5, y + 3);
+  }
+  
+  // Draw points
+  for (const p of points) {
+    const x = scaleX(p.x);
+    const y = scaleY(p.y);
+    ctx.beginPath();
+    ctx.arc(x, y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = CLUSTER_COLORS[p.cluster % CLUSTER_COLORS.length] + "cc";
+    ctx.fill();
+    ctx.strokeStyle = CLUSTER_COLORS[p.cluster % CLUSTER_COLORS.length];
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+  
+  // Draw centroids (larger diamonds)
+  for (const c of centroids) {
+    const x = scaleX(c.x);
+    const y = scaleY(c.y);
+    const size = 8;
+    ctx.beginPath();
+    ctx.moveTo(x, y - size);
+    ctx.lineTo(x + size, y);
+    ctx.lineTo(x, y + size);
+    ctx.lineTo(x - size, y);
+    ctx.closePath();
+    ctx.fillStyle = "#0055ff";
+    ctx.fill();
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+  
+  // Draw legend
+  const legendX = width - padding - 100;
+  let legendY = padding + 10;
+  ctx.fillStyle = "#1e1e2e";
+  ctx.fillRect(legendX - 5, legendY - 5, 110, (scatterData.centroids.length + 1) * 20 + 10);
+  ctx.strokeStyle = "#555577";
+  ctx.strokeRect(legendX - 5, legendY - 5, 110, (scatterData.centroids.length + 1) * 20 + 10);
+  
+  ctx.font = "10px 'Inter', sans-serif";
+  ctx.textAlign = "left";
+  for (let i = 0; i < scatterData.centroids.length; i++) {
+    // Cluster dot
+    ctx.beginPath();
+    ctx.arc(legendX + 5, legendY + 5, 4, 0, Math.PI * 2);
+    ctx.fillStyle = CLUSTER_COLORS[i % CLUSTER_COLORS.length];
+    ctx.fill();
+    ctx.fillStyle = "#ccccee";
+    ctx.fillText(`Cluster ${i}`, legendX + 15, legendY + 9);
+    legendY += 20;
+  }
+  // Centroid legend
+  ctx.beginPath();
+  ctx.moveTo(legendX + 5, legendY - 3);
+  ctx.lineTo(legendX + 10, legendY + 2);
+  ctx.lineTo(legendX + 5, legendY + 7);
+  ctx.lineTo(legendX, legendY + 2);
+  ctx.closePath();
+  ctx.fillStyle = "#0055ff";
+  ctx.fill();
+  ctx.fillStyle = "#ccccee";
+  ctx.fillText("Centroid", legendX + 15, legendY + 5);
+}
+
 function renderAnalyzeResults(result) {
   if (result.error) return `<div class="analyze-error">${escapeHtml(result.error)}</div>`;
   let html = `<div class="analyze-header"><span class="analyze-badge">${result.row_count} rows</span> <span class="analyze-badge">${result.numeric_columns.length} numeric</span> <span class="analyze-badge">${Object.keys(result.algorithms).length} algorithms</span></div>`;
@@ -613,6 +833,67 @@ function renderAnalyzeResults(result) {
       if (c.sample_rows && c.sample_rows.length > 0) {
         html += `<div class="cluster-samples">Samples: ${c.sample_rows.map((r) => JSON.stringify(r)).join(" · ")}</div>`;
       }
+      html += `</div>`;
+    }
+    // Scatter plot for K-Means
+    if (cl.scatter_data && cl.scatter_data.points && cl.scatter_data.points.length > 0) {
+      const sd = cl.scatter_data;
+      const W = 600, H = 400, P = 50;
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      for (const pt of sd.points) {
+        if (pt.x < minX) minX = pt.x; if (pt.x > maxX) maxX = pt.x;
+        if (pt.y < minY) minY = pt.y; if (pt.y > maxY) maxY = pt.y;
+      }
+      const xr = (maxX - minX) || 1, yr = (maxY - minY) || 1;
+      minX -= xr * 0.15; maxX += xr * 0.15; minY -= yr * 0.15; maxY += yr * 0.15;
+      const sx = (v) => P + ((v - minX) / (maxX - minX)) * (W - 2 * P);
+      const sy = (v) => H - P - ((v - minY) / (maxY - minY)) * (H - 2 * P);
+      const colors = ["#8b5cf6","#06b6d4","#eab308","#ef4444","#22c55e"];
+      let svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" style="width:100%;max-width:${W}px;background:#1e1e2e;border-radius:8px;border:1px solid var(--border)">`;
+      // grid
+      for (let i = 0; i <= 5; i++) {
+        const x = P + (i / 5) * (W - 2 * P), y = P + (i / 5) * (H - 2 * P);
+        svg += `<line x1="${x}" y1="${P}" x2="${x}" y2="${H-P}" stroke="#333355" stroke-width="0.5"/>`;
+        svg += `<line x1="${P}" y1="${y}" x2="${W-P}" y2="${y}" stroke="#333355" stroke-width="0.5"/>`;
+      }
+      // axes
+      svg += `<line x1="${P}" y1="${P}" x2="${P}" y2="${H-P}" stroke="#555577" stroke-width="1"/>`;
+      svg += `<line x1="${P}" y1="${H-P}" x2="${W-P}" y2="${H-P}" stroke="#555577" stroke-width="1"/>`;
+      // axis labels
+      svg += `<text x="${W/2}" y="${H-8}" text-anchor="middle" fill="#aaaacc" font-size="11" font-family="sans-serif">${escapeHtml(sd.x_label||"PC1")}</text>`;
+      svg += `<text x="14" y="${H/2}" text-anchor="middle" fill="#aaaacc" font-size="11" font-family="sans-serif" transform="rotate(-90,14,${H/2})">${escapeHtml(sd.y_label||"PC2")}</text>`;
+      // tick labels
+      for (let i = 0; i <= 5; i++) {
+        const val = minX + (i / 5) * (maxX - minX);
+        svg += `<text x="${P + (i/5)*(W-2*P)}" y="${H-P+16}" text-anchor="middle" fill="#888899" font-size="9" font-family="monospace">${val.toFixed(1)}</text>`;
+      }
+      for (let i = 0; i <= 5; i++) {
+        const val = minY + (i / 5) * (maxY - minY);
+        svg += `<text x="${P-6}" y="${H-P-(i/5)*(H-2*P)+4}" text-anchor="end" fill="#888899" font-size="9" font-family="monospace">${val.toFixed(1)}</text>`;
+      }
+      // points
+      for (const pt of sd.points) {
+        svg += `<circle cx="${sx(pt.x)}" cy="${sy(pt.y)}" r="5" fill="${colors[pt.cluster % colors.length]}" fill-opacity="0.85" stroke="white" stroke-width="0.5"/>`;
+      }
+      // centroids
+      for (const c of sd.centroids) {
+        const cx = sx(c.x), cy = sy(c.y);
+        svg += `<polygon points="${cx},${cy-9} ${cx+9},${cy} ${cx},${cy+9} ${cx-9},${cy}" fill="#0066ff" stroke="white" stroke-width="2"/>`;
+      }
+      // legend
+      let ly = P + 10;
+      svg += `<rect x="${W-P-120}" y="${ly-8}" width="115" height="${sd.centroids.length*20+32}" rx="4" fill="#1e1e2e" stroke="#555577"/>`;
+      for (let i = 0; i < sd.centroids.length; i++) {
+        svg += `<circle cx="${W-P-105}" cy="${ly+5}" r="5" fill="${colors[i]}"/>`;
+        svg += `<text x="${W-P-92}" y="${ly+9}" fill="#ccccee" font-size="10" font-family="sans-serif">Cluster ${i}</text>`;
+        ly += 20;
+      }
+      svg += `<polygon points="${W-P-105},${ly-3} ${W-P-100},${ly+2} ${W-P-105},${ly+7} ${W-P-110},${ly+2}" fill="#0066ff"/>`;
+      svg += `<text x="${W-P-92}" y="${ly+6}" fill="#ccccee" font-size="10" font-family="sans-serif">Centroid</text>`;
+      svg += `</svg>`;
+      html += `<div class="scatter-plot-container"><div class="scatter-title">Cluster Visualization (PCA Projection)</div>`;
+      html += `<div class="scatter-subtitle">Variance explained: ${(sd.variance_explained * 100).toFixed(1)}%</div>`;
+      html += svg;
       html += `</div>`;
     }
     html += `</div>`;
