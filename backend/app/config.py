@@ -1,3 +1,4 @@
+import secrets
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List
 
@@ -5,6 +6,7 @@ from typing import List
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
+    jwt_secret: str = ""
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str = "password"
@@ -28,6 +30,12 @@ class Settings(BaseSettings):
     @property
     def cors_origins_list(self) -> List[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def jwt_secret_key(self) -> str:
+        if self.jwt_secret:
+            return self.jwt_secret
+        return secrets.token_hex(32)
 
 
 settings = Settings()

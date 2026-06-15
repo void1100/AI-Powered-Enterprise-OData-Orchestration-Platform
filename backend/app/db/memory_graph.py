@@ -92,6 +92,31 @@ class InMemoryGraph:
         with self._lock:
             return list(self.services.values())
 
+    def get_custom_entities(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            out = []
+            for (svc_id, ent_name), ent in self.entities.items():
+                if ent.get("is_custom"):
+                    out.append({
+                        "service_id": svc_id,
+                        "name": ent_name,
+                        "base_entity_set": ent.get("base_entity_set", ""),
+                        "description": ent.get("description", ""),
+                        "default_filter": ent.get("default_filter", ""),
+                        "allowed_columns": ent.get("allowed_columns", []),
+                        "created_by": ent.get("created_by", ""),
+                        "created_at": ent.get("created_at", ""),
+                    })
+            return out
+
+    def delete_entity(self, service_id: str, name: str) -> bool:
+        with self._lock:
+            key = (service_id, name)
+            if key in self.entities:
+                del self.entities[key]
+                return True
+            return False
+
     def list_all_entities(self) -> List[Dict[str, Any]]:
         with self._lock:
             out = []

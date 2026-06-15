@@ -5,14 +5,15 @@ import time
 import uuid
 import re
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from app.config import settings
+from app.auth import get_current_user
 from app.schemas.models import (
     ChatRequest,
     ChatResponse,
@@ -97,7 +98,10 @@ async def get_services():
 
 
 @app.post("/services", response_model=ServiceInfo)
-async def register_service(payload: ServiceRegister):
+async def register_service(payload: ServiceRegister, request: Request):
+    user = get_current_user(request)
+    if not user or user.get("role") not in ("super_admin", "admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
     svc = await service_manager.register_service(
         service_id=payload.id,
         name=payload.name,
@@ -114,7 +118,10 @@ async def register_service(payload: ServiceRegister):
 
 
 @app.delete("/services/{service_id}")
-async def delete_service(service_id: str):
+async def delete_service(service_id: str, request: Request):
+    user = get_current_user(request)
+    if not user or user.get("role") not in ("super_admin", "admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
     if service_id not in service_manager._services:
         raise HTTPException(status_code=404, detail="Service not found")
     del service_manager._services[service_id]
@@ -124,7 +131,10 @@ async def delete_service(service_id: str):
 
 
 @app.post("/services/{service_id}/refresh", response_model=ServiceInfo)
-async def refresh_service(service_id: str):
+async def refresh_service(service_id: str, request: Request):
+    user = get_current_user(request)
+    if not user or user.get("role") not in ("super_admin", "admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
     svc = await service_manager.refresh_service(service_id)
     if not svc:
         raise HTTPException(status_code=404, detail="Service not found")
@@ -176,6 +186,105 @@ async def services_health():
     results = await asyncio.gather(*[_probe_service(s) for s in services])
     return {"services": results}
 
+
+# --- Custom Entity Endpoints (Admin Only) ---
+
+from pydantic import BaseModel as PydanticBaseModel
+
+class CustomEntityCreate(PydanticBaseModel):
+    name: str
+    base_entity_set: str
+    description: str = ""
+    default_filter: str = ""
+    allowed_columns: List[str] = []
+
+class CustomEntityUpdate(PydanticBaseModel):
+    description: Optional[str] = None
+    default_filter: Optional[str] = None
+    allowed_columns: Optional[List[str]] = None
+
+@app.get("/custom_entities")
+async def list_custom_entities(service_id: Optional[str] = None):
+    return service_manager.list_custom_entities(service_id)
+
+@app.post("/custom_entities")
+async def create_custom_entity(payload: CustomEntityCreate, request: Request):
+    from app.auth import get_current_user
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    role = user.get("role", "viewer")
+    if role not in ("super_admin", "admin"):
+        raise HTTPException(status_code=403, detail="Only admins can create custom entities")
+    try:
+        entity = service_manager.register_custom_entity(
+            service_id=list(service_manager._services.keys())[0] if len(service_manager._services) == 1 else payload.name.split("_")[0],
+            name=payload.name,
+            base_entity_set=payload.base_entity_set,
+            description=payload.description,
+            default_filter=payload.default_filter,
+            allowed_columns=payload.allowed_columns,
+            created_by=user.get("username", "admin"),
+        )
+        return entity
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/custom_entities/{service_id}")
+async def create_custom_entity_for_service(service_id: str, payload: CustomEntityCreate, request: Request):
+    from app.auth import get_current_user
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    role = user.get("role", "viewer")
+    if role not in ("super_admin", "admin"):
+        raise HTTPException(status_code=403, detail="Only admins can create custom entities")
+    try:
+        entity = service_manager.register_custom_entity(
+            service_id=service_id,
+            name=payload.name,
+            base_entity_set=payload.base_entity_set,
+            description=payload.description,
+            default_filter=payload.default_filter,
+            allowed_columns=payload.allowed_columns,
+            created_by=user.get("username", "admin"),
+        )
+        return entity
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.patch("/custom_entities/{service_id}/{name}")
+async def update_custom_entity(service_id: str, name: str, payload: CustomEntityUpdate, request: Request):
+    from app.auth import get_current_user
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    role = user.get("role", "viewer")
+    if role not in ("super_admin", "admin"):
+        raise HTTPException(status_code=403, detail="Only admins can update custom entities")
+    entity = service_manager.get_custom_entity(service_id, name)
+    if not entity:
+        raise HTTPException(status_code=404, detail="Custom entity not found")
+    if payload.description is not None:
+        entity["description"] = payload.description
+    if payload.default_filter is not None:
+        entity["default_filter"] = payload.default_filter
+    if payload.allowed_columns is not None:
+        entity["allowed_columns"] = payload.allowed_columns
+    return entity
+
+@app.delete("/custom_entities/{service_id}/{name}")
+async def delete_custom_entity(service_id: str, name: str, request: Request):
+    from app.auth import get_current_user
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    role = user.get("role", "viewer")
+    if role not in ("super_admin", "admin"):
+        raise HTTPException(status_code=403, detail="Only admins can delete custom entities")
+    if service_manager.delete_custom_entity(service_id, name):
+        return {"deleted": name}
+    raise HTTPException(status_code=404, detail="Custom entity not found")
 
 @app.get("/roles")
 async def get_roles():
@@ -233,7 +342,10 @@ async def get_llm_config():
 
 
 @app.post("/llm/config")
-async def set_llm_config(payload: Dict[str, Any]):
+async def set_llm_config(payload: Dict[str, Any], request: Request):
+    user = get_current_user(request)
+    if not user or user.get("role") not in ("super_admin", "admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
     provider = payload.get("provider")
     model = payload.get("model")
     option_id = payload.get("id")
@@ -254,13 +366,15 @@ async def set_llm_config(payload: Dict[str, Any]):
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(payload: ChatRequest):
+async def chat(payload: ChatRequest, request: Request):
+    user = get_current_user(request)
+    user_role = user.get("role", "user") if user else payload.user_role
     if not service_manager._services:
         await service_manager.recover_from_graph()
 
     session_id = payload.session_id
     if not session_id:
-        session_id = create_session(title=payload.query[:50] or "New Chat", user_role=payload.user_role)
+        session_id = create_session(title=payload.query[:50] or "New Chat", user_role=user_role)
     else:
         touch_session(session_id)
 
@@ -316,7 +430,7 @@ async def chat(payload: ChatRequest):
                     run_id=str(uuid.uuid4()),
                     session_id=session_id,
                     user_query=payload.query,
-                    user_role=payload.user_role,
+                    user_role=user_role,
                     summary=summary,
                     plan={"intent": "predict", "prediction": pred_result},
                     discovery=None,
@@ -335,7 +449,7 @@ async def chat(payload: ChatRequest):
     result = await orchestrator.run(
         user_query=payload.query,
         session_id=session_id,
-        user_role=payload.user_role,
+        user_role=user_role,
     )
 
     add_message(
@@ -465,7 +579,10 @@ async def get_session_messages(session_id: str):
 
 
 @app.post("/analyze")
-async def analyze_table(payload: Dict[str, Any]):
+async def analyze_table(payload: Dict[str, Any], request: Request):
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
     table = payload.get("table")
     if not table or not table.get("rows"):
         raise HTTPException(status_code=400, detail="No table data to analyze")
@@ -479,7 +596,10 @@ async def analyze_table(payload: Dict[str, Any]):
 
 
 @app.post("/ml/clean")
-async def ml_clean(payload: Dict[str, Any]):
+async def ml_clean(payload: Dict[str, Any], request: Request):
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
     table = payload.get("table")
     options = payload.get("options", {})
     if not table or not table.get("rows"):
@@ -494,7 +614,10 @@ async def ml_clean(payload: Dict[str, Any]):
 
 
 @app.post("/ml/train")
-async def ml_train(payload: Dict[str, Any]):
+async def ml_train(payload: Dict[str, Any], request: Request):
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
     table = payload.get("table")
     target_col = payload.get("target_column")
     algorithm = payload.get("algorithm", "random_forest")
@@ -548,7 +671,10 @@ async def ml_models():
 
 
 @app.post("/ml/predict")
-async def ml_predict(payload: Dict[str, Any]):
+async def ml_predict(payload: Dict[str, Any], request: Request):
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
     from app.services.model_store import model_store
     entity_key = payload.get("entity_key")
     features = payload.get("features", {})
@@ -669,6 +795,9 @@ async def mcp_tools():
 
 
 @app.post("/mcp/call", response_model=MCPCallResponse)
-async def mcp_call(payload: MCPCallRequest):
+async def mcp_call(payload: MCPCallRequest, request: Request):
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
     result = await mcp_server.call_tool(payload.name, payload.arguments)
     return MCPCallResponse(result=result)

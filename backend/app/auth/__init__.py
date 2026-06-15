@@ -10,8 +10,9 @@ from functools import wraps
 from fastapi import Request, HTTPException
 
 from app.auth.password import hash_password, verify_password, validate_password_strength
+from app.config import settings
 
-SECRET_KEY = os.getenv("JWT_SECRET", "odata-orchestration-secret-key-change-in-production")
+SECRET_KEY = settings.jwt_secret_key
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 REFRESH_TOKEN_EXPIRE_DAYS = 7

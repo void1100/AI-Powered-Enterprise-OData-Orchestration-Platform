@@ -83,7 +83,13 @@ class Neo4jClient:
                 SET e.type = $type,
                     e.description = $description,
                     e.allowed_ops = $allowed_ops,
-                    e.properties = $properties
+                    e.properties = $properties,
+                    e.is_custom = $is_custom,
+                    e.base_entity_set = $base_entity_set,
+                    e.default_filter = $default_filter,
+                    e.allowed_columns = $allowed_columns,
+                    e.created_by = $created_by,
+                    e.created_at = $created_at
                 MERGE (s)-[:HAS_ENTITY]->(e)
                 """,
                 service_id=entity["service_id"],
@@ -92,6 +98,12 @@ class Neo4jClient:
                 description=entity.get("description", ""),
                 allowed_ops=entity.get("allowed_ops", []),
                 properties=entity.get("properties", []),
+                is_custom=entity.get("is_custom", False),
+                base_entity_set=entity.get("base_entity_set", ""),
+                default_filter=entity.get("default_filter", ""),
+                allowed_columns=entity.get("allowed_columns", []),
+                created_by=entity.get("created_by", ""),
+                created_at=entity.get("created_at", ""),
             )
 
     def upsert_relationship(self, rel: Dict[str, Any]):
@@ -133,6 +145,38 @@ class Neo4jClient:
                 allowed_entities=role.get("allowed_entities", []),
                 allowed_services=role.get("allowed_services", []),
             )
+
+    def get_custom_entities(self) -> List[Dict[str, Any]]:
+        if not self._driver:
+            return []
+        with self._driver.session() as session:
+            result = session.run(
+                """
+                MATCH (s:Service)-[:HAS_ENTITY]->(e:Entity)
+                WHERE e.is_custom = true
+                RETURN s.id AS service_id, e.name AS name, e.base_entity_set AS base_entity_set,
+                       e.description AS description, e.default_filter AS default_filter,
+                       e.allowed_columns AS allowed_columns, e.created_by AS created_by,
+                       e.created_at AS created_at
+                """
+            )
+            return [dict(r) for r in result]
+
+    def delete_entity(self, service_id: str, name: str) -> bool:
+        if not self._driver:
+            return False
+        with self._driver.session() as session:
+            result = session.run(
+                """
+                MATCH (e:Entity {service: $service_id, name: $name})
+                DETACH DELETE e
+                RETURN count(e) AS deleted
+                """,
+                service_id=service_id,
+                name=name,
+            )
+            record = result.single()
+            return record["deleted"] > 0 if record else False
 
     def find_services_for_entities(self, entity_names: List[str]) -> List[Dict[str, Any]]:
         if not self._driver:

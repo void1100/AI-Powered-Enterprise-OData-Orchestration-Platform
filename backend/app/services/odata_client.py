@@ -35,15 +35,21 @@ class ODataClient:
         self.timeout = timeout
         self._metadata_cache: Optional[Dict[str, Any]] = None
         self._sampled: bool = False
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=self.timeout, follow_redirects=True)
+        return self._client
 
     async def get_metadata(self, force_refresh: bool = False) -> Dict[str, Any]:
         if self._metadata_cache and not force_refresh:
             return self._metadata_cache
         url = f"{self.base_url}/$metadata"
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"Accept": "application/xml"})
-            resp.raise_for_status()
-            xml_text = resp.text
+        client = await self._get_client()
+        resp = await client.get(url, headers={"Accept": "application/xml"})
+        resp.raise_for_status()
+        xml_text = resp.text
         meta = self._parse_metadata(xml_text)
         await self._enrich_by_sampling(meta)
         self._metadata_cache = meta
@@ -145,14 +151,14 @@ class ODataClient:
             if et_name in et_by_name and et_by_name[et_name].get("properties"):
                 continue
             try:
-                async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-                    resp = await client.get(
-                        f"{self.base_url}/{es['name']}?$top=1",
-                        headers={"Accept": "application/json"},
-                    )
-                    if resp.status_code != 200:
-                        continue
-                    data = resp.json()
+                client = await self._get_client()
+                resp = await client.get(
+                    f"{self.base_url}/{es['name']}?$top=1",
+                    headers={"Accept": "application/json"},
+                )
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
                 sample = (data.get("value") or [None])[0]
                 if not isinstance(sample, dict):
                     continue
@@ -235,21 +241,21 @@ class ODataClient:
             entity_set, select=select, filter_expr=filter_expr,
             expand=expand, top=top, skip=skip, orderby=orderby, count=True,
         )
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"Accept": "application/json"})
-            resp.raise_for_status()
-            data = resp.json()
+        client = await self._get_client()
+        resp = await client.get(url, headers={"Accept": "application/json"})
+        resp.raise_for_status()
+        data = resp.json()
         return data
 
     async def get_by_id(self, entity_set: str, entity_id: str, select: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         qs = f"?$select={','.join(select)}" if select else ""
         url = f"{self.base_url}/{entity_set}({entity_id}){qs}"
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"Accept": "application/json"})
-            if resp.status_code == 404:
-                return None
-            resp.raise_for_status()
-            return resp.json()
+        client = await self._get_client()
+        resp = await client.get(url, headers={"Accept": "application/json"})
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
 
     @staticmethod
     def flatten_odata_value(value: Any) -> List[Dict[str, Any]]:

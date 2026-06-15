@@ -66,7 +66,43 @@ TOOLS: List[Dict[str, Any]] = [
 
 class MCPServer:
     def __init__(self):
-        self.tools = TOOLS
+        self.tools = list(TOOLS)
+        self._custom_tool_names: set = set()
+
+    def register_custom_entity_tool(self, service_id: str, entity_name: str, description: str, allowed_columns: list, base_entity_set: str):
+        tool_name = f"query_{service_id}_{entity_name}"
+        if tool_name in self._custom_tool_names:
+            return
+        properties = {}
+        if allowed_columns:
+            properties["select"] = {
+                "type": "array",
+                "items": {"type": "string", "enum": allowed_columns},
+                "description": f"Columns to return. Allowed: {', '.join(allowed_columns)}",
+            }
+        properties["filter"] = {"type": "string", "description": "OData filter expression"}
+        properties["expand"] = {"type": "array", "items": {"type": "string"}, "description": "Related entities to expand"}
+        properties["orderby"] = {"type": "string", "description": "Order by column asc/desc"}
+        properties["top"] = {"type": "integer", "description": "Max rows to return"}
+        properties["skip"] = {"type": "integer", "description": "Rows to skip"}
+        tool = {
+            "name": tool_name,
+            "description": f"[Custom] {description}. Base: {base_entity_set}. Service: {service_id}",
+            "input_schema": {
+                "type": "object",
+                "properties": properties,
+                "required": [],
+            },
+        }
+        self.tools.append(tool)
+        self._custom_tool_names.add(tool_name)
+        logger.info(f"Registered MCP tool: {tool_name}")
+
+    def remove_custom_entity_tool(self, service_id: str, entity_name: str):
+        tool_name = f"query_{service_id}_{entity_name}"
+        self.tools = [t for t in self.tools if t["name"] != tool_name]
+        self._custom_tool_names.discard(tool_name)
+        logger.info(f"Removed MCP tool: {tool_name}")
 
     async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         if name == "list_services":
@@ -90,7 +126,35 @@ class MCPServer:
             return {"sessions": list_sessions()}
         if name == "get_messages":
             return {"messages": get_messages(arguments["session_id"])}
+        if name in self._custom_tool_names:
+            return await self._call_custom_entity_tool(name, arguments)
         return {"error": f"Unknown tool: {name}"}
+
+    async def _call_custom_entity_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        parts = tool_name.split("_", 2)
+        if len(parts) < 3:
+            return {"error": f"Invalid custom tool name: {tool_name}"}
+        service_id = parts[1]
+        entity_name = parts[2]
+        plan = {
+            "service_id": service_id,
+            "entity_set": entity_name,
+            "select": arguments.get("select"),
+            "filter": arguments.get("filter"),
+            "expand": arguments.get("expand"),
+            "top": arguments.get("top", 50),
+            "skip": arguments.get("skip"),
+            "orderby": arguments.get("orderby"),
+        }
+        try:
+            result = await service_manager.execute_plan(
+                service_id=service_id,
+                plan=plan,
+                max_rows=arguments.get("top", 50),
+            )
+            return result
+        except Exception as e:
+            return {"error": str(e)}
 
 
 mcp_server = MCPServer()

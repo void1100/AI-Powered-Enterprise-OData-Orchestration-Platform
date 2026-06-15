@@ -21,9 +21,10 @@ from app.services.odata_client import ODataClient
 class ODataRequestBuilder:
     ALLOWED_OPS_DEFAULT = {"select", "filter", "expand", "orderby", "top", "skip", "count"}
 
-    def __init__(self, client: ODataClient, allowed_ops: Optional[list] = None):
+    def __init__(self, client: ODataClient, allowed_ops: Optional[list] = None, custom_entities: Optional[Dict[str, Any]] = None):
         self.client = client
         self.allowed_ops = set(allowed_ops or self.ALLOWED_OPS_DEFAULT)
+        self.custom_entities = custom_entities or {}
 
     def validate(self, plan: Dict[str, Any]) -> Dict[str, Any]:
         cleaned: Dict[str, Any] = {}
@@ -58,24 +59,48 @@ class ODataRequestBuilder:
                 pass
         return cleaned
 
+    def _resolve_custom_entity(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+        entity_set = plan.get("entity_set", "")
+        custom = self.custom_entities.get(entity_set)
+        if not custom:
+            return plan
+        resolved = dict(plan)
+        resolved["entity_set"] = custom["base_entity_set"]
+        resolved["_custom_entity"] = entity_set
+        merged_filter = custom.get("default_filter", "")
+        user_filter = plan.get("filter", "")
+        if merged_filter and user_filter:
+            resolved["filter"] = f"({merged_filter}) and ({user_filter})"
+        elif merged_filter:
+            resolved["filter"] = merged_filter
+        elif user_filter:
+            resolved["filter"] = user_filter
+        allowed = custom.get("allowed_columns", [])
+        if allowed and plan.get("select"):
+            resolved["select"] = [s for s in plan["select"] if s in allowed]
+        elif allowed:
+            resolved["select"] = allowed
+        return resolved
+
     async def execute(self, plan: Dict[str, Any]) -> Dict[str, Any]:
         cleaned = self.validate(plan)
+        resolved = self._resolve_custom_entity(cleaned)
         url = self.client._build_url(
-            entity_set=cleaned["entity_set"],
-            select=cleaned.get("select"),
-            filter_expr=cleaned.get("filter"),
-            expand=cleaned.get("expand"),
-            top=cleaned.get("top"),
-            skip=cleaned.get("skip"),
-            orderby=cleaned.get("orderby"),
+            entity_set=resolved["entity_set"],
+            select=resolved.get("select"),
+            filter_expr=resolved.get("filter"),
+            expand=resolved.get("expand"),
+            top=resolved.get("top"),
+            skip=resolved.get("skip"),
+            orderby=resolved.get("orderby"),
         )
         result = await self.client.query(
-            entity_set=cleaned["entity_set"],
-            select=cleaned.get("select"),
-            filter_expr=cleaned.get("filter"),
-            expand=cleaned.get("expand"),
-            top=cleaned.get("top"),
-            skip=cleaned.get("skip"),
-            orderby=cleaned.get("orderby"),
+            entity_set=resolved["entity_set"],
+            select=resolved.get("select"),
+            filter_expr=resolved.get("filter"),
+            expand=resolved.get("expand"),
+            top=resolved.get("top"),
+            skip=resolved.get("skip"),
+            orderby=resolved.get("orderby"),
         )
         return {"url": url, "result": result}

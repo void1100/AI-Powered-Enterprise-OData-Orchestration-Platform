@@ -19,8 +19,8 @@ from app.schemas.models import ServiceRegister
 router = APIRouter()
 
 ROLE_PERMISSIONS = {
-    "super_admin": {"dashboard", "users", "roles", "services", "analytics", "audit", "settings"},
-    "admin": {"dashboard", "users", "roles", "services", "analytics", "audit", "settings"},
+    "super_admin": {"dashboard", "users", "roles", "services", "custom_entities", "analytics", "audit", "settings"},
+    "admin": {"dashboard", "users", "roles", "services", "custom_entities", "analytics", "audit", "settings"},
     "analyst": {"dashboard", "analytics", "services"},
     "user": {"dashboard"},
     "viewer": {"dashboard"},
@@ -110,7 +110,9 @@ async def login(body: LoginRequest, request: Request, response: Response):
     access_token = create_access_token(token_data)
     refresh_token = create_refresh_token(token_data)
 
-    response.set_cookie("access_token", access_token, httponly=True, secure=False, samesite="strict", max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60)
+    import os as _os
+    _is_prod = _os.getenv("ENVIRONMENT", "development").lower() == "production"
+    response.set_cookie("access_token", access_token, httponly=True, secure=_is_prod, samesite="strict", max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60)
 
     db.log_audit(user_id=user["id"], username=user["username"], action="login", resource="auth", ip_address=request.client.host, status="success")
 
@@ -399,10 +401,15 @@ async def list_services_admin(request: Request, user=Depends(require_permission(
 async def register_service_admin(request: Request, body: ServiceRegister, user=Depends(require_permission("services"))):
     from app.services.service_manager import service_manager
     try:
-        info = await service_manager.register(body.id, body.name, body.base_url, body.description or "")
+        info = await service_manager.register_service(
+            service_id=body.id,
+            name=body.name,
+            base_url=body.base_url,
+            description=body.description or "",
+        )
         db = get_auth_db()
         db.log_audit(user_id=user.get("user_id"), username=user.get("sub"), action="create", resource="services", resource_id=body.id, ip_address=request.client.host, status="success")
-        return info
+        return {"id": info["id"], "name": info["name"], "base_url": info["base_url"]}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -410,9 +417,11 @@ async def register_service_admin(request: Request, body: ServiceRegister, user=D
 @router.delete("/admin/services/{service_id}")
 async def delete_service_admin(service_id: str, request: Request, user=Depends(require_permission("services"))):
     from app.services.service_manager import service_manager
-    ok = await service_manager.deregister(service_id)
-    if not ok:
+    if service_id not in service_manager._services:
         raise HTTPException(status_code=404, detail="Service not found")
+    del service_manager._services[service_id]
+    service_manager._clients.pop(service_id, None)
+    service_manager._entity_to_set.pop(service_id, None)
 
     db = get_auth_db()
     db.log_audit(user_id=user.get("user_id"), username=user.get("sub"), action="delete", resource="services", resource_id=service_id, ip_address=request.client.host, status="success")

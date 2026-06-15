@@ -88,6 +88,7 @@ function navigateTo(page) {
     users: "User Management",
     roles: "Role Management",
     services: "Service Management",
+    custom_entities: "Custom Entities",
     analytics: "Analytics",
     audit: "Audit Log",
     settings: "System Settings",
@@ -103,6 +104,7 @@ async function loadPage(page) {
     else if (page === "users") await loadUsers(content);
     else if (page === "roles") await loadRoles(content);
     else if (page === "services") await loadServices(content);
+    else if (page === "custom_entities") await loadCustomEntities(content);
     else if (page === "analytics") await loadAnalytics(content);
     else if (page === "audit") await loadAudit(content);
     else if (page === "settings") await loadSettings(content);
@@ -462,6 +464,226 @@ async function deleteService(id) {
   } catch (e) { toast(e.message, "error"); }
 }
 
+// --- Custom Entities ---
+async function loadCustomEntities(el) {
+  const [entities, services] = await Promise.all([
+    api("/custom_entities"),
+    api("/services"),
+  ]);
+  el.innerHTML = `
+    <div class="table-wrap">
+      <div class="table-header">
+        <h2>Custom Entities (${entities.length})</h2>
+        <div class="table-actions">
+          <button class="btn btn-primary btn-sm" onclick="showCreateCustomEntity()">+ Create Entity</button>
+        </div>
+      </div>
+      ${entities.length === 0 ? '<div class="empty-state"><p>No custom entities yet. Click "+ Create Entity" to start.</p></div>' : `
+      <table>
+        <thead><tr><th>Name</th><th>Service</th><th>Base Entity</th><th>Description</th><th>Filter</th><th>Columns</th><th>Created By</th><th>Actions</th></tr></thead>
+        <tbody>
+          ${entities.map(e => `
+            <tr>
+              <td><strong>${escapeHtml(e.name)}</strong></td>
+              <td>${escapeHtml(e.service_id)}</td>
+              <td>${escapeHtml(e.base_entity_set)}</td>
+              <td>${escapeHtml(e.description || "—")}</td>
+              <td><code>${escapeHtml(e.default_filter || "none")}</code></td>
+              <td>${(e.allowed_columns || []).length > 0 ? e.allowed_columns.map(c => `<span class="badge badge-active">${escapeHtml(c)}</span>`).join(" ") : "<em>all</em>"}</td>
+              <td>${escapeHtml(e.created_by || "—")}</td>
+              <td>
+                <button class="btn btn-ghost btn-sm" onclick="testCustomEntity('${escapeHtml(e.service_id)}','${escapeHtml(e.name)}')">Test</button>
+                <button class="btn btn-ghost btn-sm" onclick="editCustomEntity('${escapeHtml(e.service_id)}','${escapeHtml(e.name)}')">Edit</button>
+                <button class="btn btn-danger btn-sm" onclick="deleteCustomEntity('${escapeHtml(e.service_id)}','${escapeHtml(e.name)}')">Delete</button>
+              </td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>`}
+    </div>
+    <div class="table-wrap" style="margin-top:24px">
+      <div class="table-header"><h2>Quick Create (Chatbox)</h2></div>
+      <div style="padding:16px">
+        <div style="display:flex;gap:8px">
+          <input type="text" id="customEntityChat" placeholder='Describe your custom entity, e.g. "Create VIP_Customers from Customers where Country is USA"' style="flex:1;padding:8px 12px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text)">
+          <button class="btn btn-primary" onclick="chatCreateCustomEntity()">Create</button>
+        </div>
+        <div id="customEntityChatResult" style="margin-top:8px"></div>
+      </div>
+    </div>
+  `;
+  window._customEntityServices = services;
+}
+
+function showCreateCustomEntity() {
+  const services = window._customEntityServices || [];
+  showModal(`
+    <h2 style="margin:0 0 16px">Create Custom Entity</h2>
+    <div class="form-group">
+      <label>Service</label>
+      <select id="ceService" class="form-input" onchange="loadBaseEntities(this.value)">
+        ${services.map(s => `<option value="${s.id}">${escapeHtml(s.name)} (${s.id})</option>`).join("")}
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Base Entity Set</label>
+      <select id="ceBaseEntity" class="form-input"><option>Loading...</option></select>
+    </div>
+    <div class="form-group">
+      <label>Custom Name</label>
+      <input type="text" id="ceName" class="form-input" placeholder="e.g. VIP_Customers">
+    </div>
+    <div class="form-group">
+      <label>Description</label>
+      <input type="text" id="ceDesc" class="form-input" placeholder="e.g. VIP Customers from USA only">
+    </div>
+    <div class="form-group">
+      <label>Default Filter (OData syntax)</label>
+      <input type="text" id="ceFilter" class="form-input" placeholder="e.g. Country eq 'USA'">
+    </div>
+    <div class="form-group">
+      <label>Allowed Columns (comma-separated, blank = all)</label>
+      <input type="text" id="ceColumns" class="form-input" placeholder="e.g. CustomerID, CompanyName, City">
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="submitCreateCustomEntity()">Create</button>
+    </div>
+  `);
+  if (services.length > 0) loadBaseEntities(services[0].id);
+}
+
+async function loadBaseEntities(serviceId) {
+  const sel = document.getElementById("ceBaseEntity");
+  const services = window._customEntityServices || [];
+  const svc = services.find(s => s.id === serviceId);
+  sel.innerHTML = (svc?.entity_sets || []).map(es => `<option value="${es}">${es}</option>`).join("");
+}
+
+async function submitCreateCustomEntity() {
+  const serviceId = document.getElementById("ceService").value;
+  const name = document.getElementById("ceName").value.trim();
+  const baseEntity = document.getElementById("ceBaseEntity").value;
+  const desc = document.getElementById("ceDesc").value.trim();
+  const filter = document.getElementById("ceFilter").value.trim();
+  const cols = document.getElementById("ceColumns").value.split(",").map(s => s.trim()).filter(Boolean);
+  if (!name) return toast("Name is required", "error");
+  if (!baseEntity) return toast("Base entity is required", "error");
+  try {
+    await api(`/custom_entities/${serviceId}`, {
+      method: "POST",
+      body: { name, base_entity_set: baseEntity, description: desc, default_filter: filter, allowed_columns: cols },
+    });
+    closeModal(); toast("Custom entity created");
+    loadCustomEntities(document.getElementById("pageContent"));
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function chatCreateCustomEntity() {
+  const input = document.getElementById("customEntityChat");
+  const resultDiv = document.getElementById("customEntityChatResult");
+  const text = input.value.trim();
+  if (!text) return;
+  resultDiv.innerHTML = '<span style="color:var(--text-muted)">Processing...</span>';
+  try {
+    const services = window._customEntityServices || [];
+    const firstService = services[0];
+    if (!firstService) return resultDiv.innerHTML = '<span style="color:var(--danger)">No services registered</span>';
+    const nameMatch = text.match(/(?:called?|named?|name\s+is?)\s+(\w+)/i);
+    const filterMatch = text.match(/where\s+(.+?)(?:\s+and\s+|\s*$)/i);
+    const baseMatch = text.match(/from\s+(\w+)/i);
+    const colsMatch = text.match(/columns?\s+(.+?)(?:\s+and\s+|\s*$)/i);
+    const name = nameMatch ? nameMatch[1] : "Custom_" + (baseMatch ? baseMatch[1] : "Entity");
+    const baseEntity = baseMatch ? baseMatch[1] : firstService.entity_sets[0] || "Entities";
+    const filter = filterMatch ? filterMatch[1] : "";
+    const cols = colsMatch ? colsMatch[1].split(/[,\s]+and\s+/).map(s => s.trim()).filter(Boolean) : [];
+    await api(`/custom_entities/${firstService.id}`, {
+      method: "POST",
+      body: { name, base_entity_set: baseEntity, description: text, default_filter: filter, allowed_columns: cols },
+    });
+    resultDiv.innerHTML = `<span style="color:var(--success)">Created "<strong>${escapeHtml(name)}</strong>" from ${escapeHtml(baseEntity)}</span>`;
+    input.value = "";
+    loadCustomEntities(document.getElementById("pageContent"));
+  } catch (e) {
+    resultDiv.innerHTML = `<span style="color:var(--danger)">Error: ${escapeHtml(e.message)}</span>`;
+  }
+}
+
+async function editCustomEntity(serviceId, name) {
+  const entity = (await api("/custom_entities")).find(e => e.service_id === serviceId && e.name === name);
+  if (!entity) return toast("Entity not found", "error");
+  showModal(`
+    <h2 style="margin:0 0 16px">Edit: ${escapeHtml(name)}</h2>
+    <div class="form-group">
+      <label>Description</label>
+      <input type="text" id="editCeDesc" class="form-input" value="${escapeHtml(entity.description || "")}">
+    </div>
+    <div class="form-group">
+      <label>Default Filter</label>
+      <input type="text" id="editCeFilter" class="form-input" value="${escapeHtml(entity.default_filter || "")}">
+    </div>
+    <div class="form-group">
+      <label>Allowed Columns (comma-separated)</label>
+      <input type="text" id="editCeColumns" class="form-input" value="${(entity.allowed_columns || []).join(", ")}">
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="submitEditCustomEntity('${escapeHtml(serviceId)}','${escapeHtml(name)}')">Save</button>
+    </div>
+  `);
+}
+
+async function submitEditCustomEntity(serviceId, name) {
+  const desc = document.getElementById("editCeDesc").value.trim();
+  const filter = document.getElementById("editCeFilter").value.trim();
+  const cols = document.getElementById("editCeColumns").value.split(",").map(s => s.trim()).filter(Boolean);
+  try {
+    await api(`/custom_entities/${serviceId}/${name}`, {
+      method: "PATCH",
+      body: { description: desc, default_filter: filter, allowed_columns: cols },
+    });
+    closeModal(); toast("Updated");
+    loadCustomEntities(document.getElementById("pageContent"));
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function deleteCustomEntity(serviceId, name) {
+  if (!confirm(`Delete custom entity "${name}"?`)) return;
+  try {
+    await api(`/custom_entities/${serviceId}/${name}`, { method: "DELETE" });
+    toast("Deleted");
+    loadCustomEntities(document.getElementById("pageContent"));
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function testCustomEntity(serviceId, name) {
+  showModal(`
+    <h2 style="margin:0 0 16px">Test: ${escapeHtml(name)}</h2>
+    <div id="ceTestResult"><span style="color:var(--text-muted)">Running test query...</span></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+      <button class="btn btn-ghost" onclick="closeModal()">Close</button>
+    </div>
+  `);
+  try {
+    const result = await api("/chat", { method: "POST", body: { query: `Show top 5 from ${name}`, role: "admin" } });
+    const resultDiv = document.getElementById("ceTestResult");
+    if (result.table && result.table.rows && result.table.rows.length > 0) {
+      resultDiv.innerHTML = `
+        <p style="color:var(--success);margin:0 0 8px">Test passed! ${result.table.rows.length} rows returned.</p>
+        <div style="max-height:300px;overflow:auto">
+          <table style="width:100%;font-size:12px">
+            <thead><tr>${(result.table.columns || []).map(c => `<th>${escapeHtml(c)}</th>`).join("")}</tr></thead>
+            <tbody>${result.table.rows.slice(0, 5).map(r => `<tr>${(Array.isArray(r) ? r : Object.values(r)).map(v => `<td>${escapeHtml(String(v ?? ""))}</td>`).join("")}</tr>`).join("")}</tbody>
+          </table>
+        </div>`;
+    } else {
+      resultDiv.innerHTML = `<p style="color:var(--danger)">No data returned. ${result.error ? escapeHtml(result.error) : ""}</p>`;
+    }
+  } catch (e) {
+    document.getElementById("ceTestResult").innerHTML = `<p style="color:var(--danger)">Error: ${escapeHtml(e.message)}</p>`;
+  }
+}
+
 // --- Analytics ---
 async function loadAnalytics(el) {
   const data = await api("/admin/analytics");
@@ -597,8 +819,8 @@ async function init() {
 }
 
 const ROLE_PERMISSIONS = {
-  super_admin: ["dashboard", "users", "roles", "services", "analytics", "audit", "settings"],
-  admin: ["dashboard", "users", "roles", "services", "analytics", "audit", "settings"],
+  super_admin: ["dashboard", "users", "roles", "services", "custom_entities", "analytics", "audit", "settings"],
+  admin: ["dashboard", "users", "roles", "services", "custom_entities", "analytics", "audit", "settings"],
   analyst: ["dashboard", "analytics", "services"],
   user: ["dashboard"],
   viewer: ["dashboard"],

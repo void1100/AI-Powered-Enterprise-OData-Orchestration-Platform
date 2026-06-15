@@ -59,6 +59,7 @@ class ODataServiceManager:
         self._services: Dict[str, Dict[str, Any]] = {}
         self._clients: Dict[str, ODataClient] = {}
         self._entity_to_set: Dict[str, Dict[str, str]] = {}
+        self._custom_entities: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._lock = asyncio.Lock()
 
     def graph(self):
@@ -226,6 +227,7 @@ class ODataServiceManager:
         """Restore service registrations from the graph DB and refresh
         metadata from the upstream OData endpoint. Used at backend startup
         so the in-memory service map stays consistent across restarts.
+        Also restores custom entities and re-registers MCP tools.
         """
         g = self.graph()
         try:
@@ -253,6 +255,48 @@ class ODataServiceManager:
                 logger.info(f"  {sid}: recovered")
             except Exception as e:
                 logger.warning(f"  Failed to recover {sid}: {e}")
+        self._recover_custom_entities(g)
+
+    def _recover_custom_entities(self, g):
+        """Restore custom entities from Neo4j and re-register MCP tools."""
+        try:
+            custom_entities = g.get_custom_entities()
+        except Exception as e:
+            logger.warning(f"Could not read custom entities from graph: {e}")
+            return
+        for ce in custom_entities:
+            sid = ce.get("service_id")
+            name = ce.get("name")
+            if not sid or not name:
+                continue
+            if sid not in self._services:
+                continue
+            if sid not in self._custom_entities:
+                self._custom_entities[sid] = {}
+            self._custom_entities[sid][name] = {
+                "name": name,
+                "service_id": sid,
+                "base_entity_set": ce.get("base_entity_set", ""),
+                "description": ce.get("description", ""),
+                "default_filter": ce.get("default_filter", ""),
+                "allowed_columns": ce.get("allowed_columns", []),
+                "created_by": ce.get("created_by", ""),
+                "created_at": ce.get("created_at", ""),
+                "is_custom": True,
+            }
+            meta = self._services[sid]["metadata"]
+            meta.setdefault("entity_sets", []).append({"name": name, "entity_type": name})
+            logger.info(f"  Recovered custom entity '{name}' on {sid}")
+            try:
+                from app.mcp.mcp_server import mcp_server
+                mcp_server.register_custom_entity_tool(
+                    sid, name,
+                    ce.get("description", ""),
+                    ce.get("allowed_columns", []),
+                    ce.get("base_entity_set", ""),
+                )
+            except Exception as e:
+                logger.warning(f"  Failed to register MCP tool for {name}: {e}")
 
     def get_service(self, service_id: str) -> Optional[Dict[str, Any]]:
         return self._services.get(service_id)
@@ -270,7 +314,7 @@ class ODataServiceManager:
         client = self.get_client(service_id)
         if not client:
             raise ValueError(f"Unknown service: {service_id}")
-        builder = ODataRequestBuilder(client, allowed_ops=allowed_ops)
+        builder = ODataRequestBuilder(client, allowed_ops=allowed_ops, custom_entities=self._custom_entities.get(service_id, {}))
         execution = await builder.execute(plan)
         sanitized = sanitize(execution["result"], max_rows=max_rows)
         return {
@@ -278,6 +322,118 @@ class ODataServiceManager:
             "url": execution["url"],
             "table": sanitized,
         }
+
+    # --- Custom Entity Management ---
+
+    def register_custom_entity(
+        self,
+        service_id: str,
+        name: str,
+        base_entity_set: str,
+        description: str = "",
+        default_filter: str = "",
+        allowed_columns: Optional[List[str]] = None,
+        created_by: str = "admin",
+    ) -> Dict[str, Any]:
+        if service_id not in self._services:
+            raise ValueError(f"Unknown service: {service_id}")
+        if service_id not in self._custom_entities:
+            self._custom_entities[service_id] = {}
+        custom_def = {
+            "name": name,
+            "service_id": service_id,
+            "base_entity_set": base_entity_set,
+            "description": description,
+            "default_filter": default_filter,
+            "allowed_columns": allowed_columns or [],
+            "created_by": created_by,
+            "created_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+            "is_custom": True,
+        }
+        self._custom_entities[service_id][name] = custom_def
+        g = self.graph()
+        g.upsert_entity({
+            "service_id": service_id,
+            "name": name,
+            "type": "CustomEntity",
+            "description": f"[Custom] {description}. Derived from {base_entity_set}.",
+            "allowed_ops": ["select", "filter", "expand", "orderby", "top", "skip"],
+            "properties": allowed_columns or [],
+            "is_custom": True,
+            "base_entity_set": base_entity_set,
+            "default_filter": default_filter,
+            "allowed_columns": allowed_columns or [],
+            "created_by": created_by,
+            "created_at": custom_def["created_at"],
+        })
+        svc = self._services[service_id]
+        svc["metadata"].setdefault("entity_sets", []).append({"name": name, "entity_type": name})
+        svc["metadata"].setdefault("entity_types", []).append({
+            "name": name,
+            "namespace": "Custom",
+            "properties": [{"name": c, "type": "Edm.String", "nullable": True} for c in (allowed_columns or [])],
+            "keys": [],
+            "navigation_properties": [],
+        })
+        text = (
+            f"Service: {svc['name']}. Entity set: {name} (Custom). "
+            f"Description: {description}. Derived from {base_entity_set}. "
+            f"Columns: {', '.join(allowed_columns or [])}."
+        )
+        vector_store.index_tool(
+            tool_id=f"{service_id}::{name}",
+            text=text,
+            metadata={
+                "service_id": service_id,
+                "service_name": svc["name"],
+                "entity_set": name,
+                "entity_type": "CustomEntity",
+                "properties": allowed_columns or [],
+                "is_custom": True,
+                "base_entity_set": base_entity_set,
+            },
+        )
+        logger.info(f"Registered custom entity '{name}' on {service_id} (base: {base_entity_set})")
+        try:
+            from app.mcp.mcp_server import mcp_server
+            mcp_server.register_custom_entity_tool(service_id, name, description, allowed_columns or [], base_entity_set)
+        except Exception as e:
+            logger.warning(f"Failed to register MCP tool for {name}: {e}")
+        return custom_def
+
+    def list_custom_entities(self, service_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        if service_id:
+            return list(self._custom_entities.get(service_id, {}).values())
+        out = []
+        for sid, entities in self._custom_entities.items():
+            out.extend(entities.values())
+        return out
+
+    def get_custom_entity(self, service_id: str, name: str) -> Optional[Dict[str, Any]]:
+        return self._custom_entities.get(service_id, {}).get(name)
+
+    def delete_custom_entity(self, service_id: str, name: str) -> bool:
+        if service_id in self._custom_entities and name in self._custom_entities[service_id]:
+            del self._custom_entities[service_id][name]
+            meta = self._services.get(service_id, {}).get("metadata", {})
+            meta["entity_sets"] = [es for es in meta.get("entity_sets", []) if es.get("name") != name]
+            meta["entity_types"] = [et for et in meta.get("entity_types", []) if et.get("name") != name]
+            logger.info(f"Deleted custom entity '{name}' from {service_id}")
+            try:
+                from app.mcp.mcp_server import mcp_server
+                mcp_server.remove_custom_entity_tool(service_id, name)
+            except Exception as e:
+                logger.warning(f"Failed to remove MCP tool for {name}: {e}")
+            try:
+                g = self.graph()
+                g.delete_entity(service_id, name)
+            except Exception as e:
+                logger.warning(f"Failed to delete custom entity from graph: {e}")
+            return True
+        return False
+
+    def resolve_custom_entity(self, service_id: str, entity_set: str) -> Optional[Dict[str, Any]]:
+        return self._custom_entities.get(service_id, {}).get(entity_set)
 
 
 service_manager = ODataServiceManager()
