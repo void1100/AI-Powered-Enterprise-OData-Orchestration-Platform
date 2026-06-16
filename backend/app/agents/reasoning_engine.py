@@ -143,7 +143,7 @@ class LLMReasoningEngine:
         }
 
     def _infer_intent(self, q: str) -> str:
-        if any(w in q for w in ["how many", "count", "total"]):
+        if any(w in q for w in ["how many", "count", "total", "which", "least", "fewest", "most", "highest", "lowest"]):
             return "aggregate"
         if any(w in q for w in ["with", "including", "and their", "along with"]):
             return "navigate"

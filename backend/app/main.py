@@ -152,7 +152,7 @@ async def _probe_service(svc: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{base}/$metadata"
     t0 = time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=4.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
             resp = await client.get(url, headers={"Accept": "application/xml"})
         latency_ms = int((time.perf_counter() - t0) * 1000)
         if resp.status_code == 200:
@@ -351,6 +351,31 @@ async def delete_join(join_id: str, request: Request):
         return {"deleted": join_id}
     raise HTTPException(status_code=404, detail="Join not found")
 
+@app.patch("/joins/{join_id}")
+async def update_join(join_id: str, payload: JoinCreate, request: Request):
+    user = get_current_user(request)
+    if not user or user.get("role") not in ("super_admin", "admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    g = service_manager.graph()
+    existing = g.get_join(join_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Join not found")
+    updated = {
+        **existing,
+        "name": payload.name,
+        "strategy": payload.strategy,
+        "left_service": payload.left_service,
+        "left_entity": payload.left_entity,
+        "left_key": payload.left_key,
+        "right_service": payload.right_service,
+        "right_entity": payload.right_entity,
+        "right_key": payload.right_key,
+        "column_mapping": payload.column_mapping,
+        "description": payload.description,
+    }
+    g.upsert_join(updated)
+    return updated
+
 @app.post("/joins/{join_id}/execute")
 async def execute_join(join_id: str, request: Request):
     user = get_current_user(request)
@@ -471,11 +496,86 @@ async def join_chat(join_id: str, request: Request):
     rows = result.get("rows", [])
     cols = result.get("columns", [])
     important_cols = [c for c in cols if not c.startswith("@odata") and c not in ("Emails", "AddressInfo", "Concurrency", "Photo", "Notes", "PhotoPath")]
-    sample_rows = rows[:10]
+
+    import re as _re
+    filter_match = _re.search(r'(?:where|whose|filter|with)\s+(\w+)\s*(>|<|>=|<=|!=|=|==)\s*([\d.]+)', query, _re.IGNORECASE)
+    filtered_rows = rows
+    filter_info = None
+    if filter_match:
+        col_name = filter_match.group(1)
+        op = filter_match.group(2)
+        val = float(filter_match.group(3))
+        matched_col = None
+        for c in important_cols:
+            if c.lower() == col_name.lower():
+                matched_col = c
+                break
+        if matched_col:
+            def _check(row):
+                rv = row.get(matched_col)
+                if rv is None:
+                    return False
+                try:
+                    rv = float(rv)
+                except (ValueError, TypeError):
+                    return False
+                if op == ">": return rv > val
+                if op == "<": return rv < val
+                if op == ">=": return rv >= val
+                if op == "<=": return rv <= val
+                if op in ("!=", "<>"): return rv != val
+                return rv == val
+            filtered_rows = [r for r in rows if _check(r)]
+            filter_info = f"{matched_col} {op} {val}"
+
+    agg_match = _re.search(r'(sum|total|average|avg|min|minimum|max|maximum|count)\s+(?:of\s+)?(\w+)', query, _re.IGNORECASE)
+    if agg_match:
+        agg_func = agg_match.group(1).lower()
+        agg_col_name = agg_match.group(2)
+        matched_agg_col = None
+        for c in important_cols:
+            if c.lower() == agg_col_name.lower():
+                matched_agg_col = c
+                break
+        if matched_agg_col:
+            nums = []
+            for r in filtered_rows:
+                v = r.get(matched_agg_col)
+                if v is not None:
+                    try:
+                        nums.append(float(v))
+                    except (ValueError, TypeError):
+                        pass
+            if nums:
+                if agg_func in ("sum", "total"):
+                    result_val = round(sum(nums), 2)
+                    answer = f"Sum of {matched_agg_col}{(' where ' + filter_info) if filter_info else ''}: {result_val}"
+                elif agg_func in ("average", "avg"):
+                    result_val = round(sum(nums) / len(nums), 2)
+                    answer = f"Average of {matched_agg_col}{(' where ' + filter_info) if filter_info else ''}: {result_val} (from {len(nums)} values)"
+                elif agg_func in ("min", "minimum"):
+                    result_val = min(nums)
+                    answer = f"Minimum of {matched_agg_col}{(' where ' + filter_info) if filter_info else ''}: {result_val}"
+                elif agg_func in ("max", "maximum"):
+                    result_val = max(nums)
+                    answer = f"Maximum of {matched_agg_col}{(' where ' + filter_info) if filter_info else ''}: {result_val}"
+                elif agg_func == "count":
+                    result_val = len(nums)
+                    answer = f"Count of {matched_agg_col}{(' where ' + filter_info) if filter_info else ''}: {result_val}"
+                else:
+                    answer = f"Could not compute {agg_func} for {matched_agg_col}"
+                return {
+                    "answer": answer,
+                    "provider": "computed",
+                    "join_name": join_def["name"],
+                    "row_count": len(rows),
+                }
+
+    sample_rows = filtered_rows[:50]
     data_summary = " | ".join(important_cols) + "\n"
     data_summary += "\n".join(" | ".join(str(r.get(c, ""))[:30] for c in important_cols) for r in sample_rows)
-    if len(rows) > 10:
-        data_summary += f"\n... ({len(rows)} total rows)"
+    if len(filtered_rows) > 50:
+        data_summary += f"\n... ({len(filtered_rows)} total rows)"
 
     system_prompt = (
         "You are a data analyst. Answer questions about this cross-service join result.\n"
@@ -483,8 +583,9 @@ async def join_chat(join_id: str, request: Request):
         f"Left: {join_def['left_service']}.{join_def['left_entity']}\n"
         f"Right: {join_def['right_service']}.{join_def['right_entity']}\n"
         f"Columns: {', '.join(important_cols)}\n"
-        f"Total rows: {len(rows)}\n\n"
-        "Data sample:\n" + data_summary + "\n\n"
+        f"Total rows: {len(rows)}\n"
+        + (f"Filter applied: {filter_info} → {len(filtered_rows)} matching rows\n" if filter_info else "")
+        + "Data sample:\n" + data_summary + "\n\n"
         "Be concise. Answer based on this data."
     )
 
@@ -500,12 +601,18 @@ async def join_chat(join_id: str, request: Request):
         )
         answer = response.get("content", "No response from LLM.")
         provider = response.get("provider", "unknown")
-        return {
+        wants_table = bool(_re.search(r'show|list|display|details|all rows|records|entries|table|export|csv', query, _re.IGNORECASE))
+        is_count = bool(_re.search(r'^(?:how many|count|total|what is the number|number of)', query, _re.IGNORECASE))
+        resp = {
             "answer": answer,
             "provider": provider,
             "join_name": join_def["name"],
             "row_count": len(rows),
         }
+        if filter_info and filtered_rows and wants_table and not is_count:
+            resp["table"] = {"columns": important_cols, "rows": filtered_rows[:200], "row_count": len(filtered_rows), "truncated": len(filtered_rows) > 200, "total_count": len(filtered_rows)}
+            resp["summary"] = f"Filtered by {filter_info}: {len(filtered_rows)} rows matching"
+        return resp
     except Exception as e:
         logger.error(f"Join chat failed: {e}")
         raise HTTPException(status_code=500, detail=f"LLM Error: {str(e)}")
@@ -713,6 +820,47 @@ async def chat(payload: ChatRequest, request: Request):
         except Exception as e:
             logger.warning(f"Table validation failed: {e}")
             table_obj = None
+
+    # Post-fetch aggregation for queries like "Count customers per country"
+    from app.services.aggregator import detect_aggregation, aggregate
+    agg_info = detect_aggregation(payload.query)
+    if agg_info and result.get("table") and result["table"].get("rows"):
+        try:
+            t = result["table"]
+            agg_result = aggregate(t["rows"], t["columns"], agg_info)
+            result["table"] = agg_result
+            table_obj = TableData(**agg_result)
+            func_label = agg_info["func"].upper()
+            group_label = agg_info.get("group_by") or agg_info.get("agg_col") or ""
+            result["summary"] = f"Aggregated result: {func_label} by {group_label} ({agg_result['row_count']} groups from {t.get('row_count', '?')} rows)"
+        except Exception as e:
+            logger.warning(f"Aggregation failed: {e}")
+
+    # Post-aggregation computation (percentage, comparison, ratio)
+    from app.services.post_processor import detect_post_processing, post_process
+    pp_info = detect_post_processing(payload.query)
+    if pp_info and result.get("table") and result["table"].get("rows"):
+        try:
+            t = result["table"]
+            pp_result = post_process(t["rows"], t["columns"], pp_info, payload.query)
+            result["table"] = pp_result
+            table_obj = TableData(**pp_result)
+            pp_type = pp_info.get("type", "")
+            if pp_type == "percentage":
+                result["summary"] = f"Percentage breakdown ({pp_result['row_count']} groups)"
+            elif pp_type == "comparison":
+                result["summary"] = f"Comparison result ({pp_result['row_count']} entries)"
+            elif pp_type in ("which_extremum", "extremum"):
+                extremum = pp_info.get("extremum", "min")
+                result_row = next((r for r in pp_result.get("rows", []) if "result" in r), None)
+                if result_row:
+                    result["summary"] = result_row["result"]
+                else:
+                    result["summary"] = f"Found the {'least' if extremum == 'min' else 'most'} ({pp_result['row_count']} entries)"
+            elif pp_type == "ratio":
+                result["summary"] = f"Ratio calculation ({pp_result['row_count']} entries)"
+        except Exception as e:
+            logger.warning(f"Post-processing failed: {e}")
 
     # Auto-train model on query results for prediction capability
     if result.get("table") and result["table"].get("rows") and len(result["table"]["rows"]) >= 5:

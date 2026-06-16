@@ -317,17 +317,69 @@ class ODataServiceManager:
         service_id: str,
         plan: Dict[str, Any],
         allowed_ops: Optional[list] = None,
-        max_rows: int = 50,
+        max_rows: int = 200,
     ) -> Dict[str, Any]:
         client = self.get_client(service_id)
         if not client:
             raise ValueError(f"Unknown service: {service_id}")
         builder = ODataRequestBuilder(client, allowed_ops=allowed_ops, custom_entities=self._custom_entities.get(service_id, {}))
         execution = await builder.execute(plan)
-        sanitized = sanitize(execution["result"], max_rows=max_rows)
+        raw = execution["result"]
+        rows = raw.get("value", []) if isinstance(raw, dict) else []
+        total_count = raw.get("@odata.count") if isinstance(raw, dict) else None
+        url = execution["url"]
+
+        base_url = url.split("?")[0] if "?" in url else url
+
+        if total_count and total_count > len(rows) and total_count <= max_rows:
+            page_size = len(rows) if len(rows) > 0 else 20
+            skip = len(rows)
+            while skip < total_count and skip < max_rows:
+                try:
+                    page_size_actual = min(page_size, max_rows - skip)
+                    page_url = f"{base_url}?$skip={skip}&$top={page_size_actual}"
+                    if "$count" in url:
+                        page_url += "&$count=true"
+                    client_obj = await client._get_client()
+                    resp = await client_obj.get(page_url, headers={"Accept": "application/json"})
+                    resp.raise_for_status()
+                    page_data = resp.json()
+                    page_rows = page_data.get("value", [])
+                    if not page_rows:
+                        break
+                    rows.extend(page_rows)
+                    skip += len(page_rows)
+                except Exception:
+                    break
+
+        if total_count and len(rows) > max_rows:
+            rows = rows[:max_rows]
+
+        cleaned_rows = []
+        for r in rows:
+            if isinstance(r, dict):
+                cleaned_rows.append({k: v for k, v in r.items() if k != "@odata.etag"})
+
+        columns = []
+        for r in cleaned_rows:
+            if isinstance(r, dict):
+                for k in r.keys():
+                    if k not in columns and not k.startswith("@odata"):
+                        columns.append(k)
+        if len(columns) > 10:
+            columns = columns[:10]
+        cleaned_rows = [{k: v for k, v in r.items() if k in columns} for r in cleaned_rows]
+
+        sanitized = {
+            "columns": columns,
+            "rows": cleaned_rows,
+            "row_count": total_count or len(cleaned_rows),
+            "truncated": (total_count or len(cleaned_rows)) > len(cleaned_rows),
+            "total_count": total_count,
+        }
         return {
             "service_id": service_id,
-            "url": execution["url"],
+            "url": url,
             "table": sanitized,
         }
 

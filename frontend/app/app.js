@@ -155,7 +155,8 @@ function addAssistantBubble(summary, result, scroll = true, paginationInfo = nul
     badge.textContent = `LLM: ${provider} · ${latency}${tokens}${corrected}`;
     div.appendChild(badge);
   }
-  if (result && result.table) {
+  const isExtremumAnswer = summary && (summary.startsWith("Least:") || summary.startsWith("Most:"));
+  if (result && result.table && !isExtremumAnswer) {
     const tableWrap = renderTable(result.table, paginationInfo);
     if (tableWrap) {
       const panel = buildResultPanel(result.table);

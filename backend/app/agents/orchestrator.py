@@ -138,6 +138,18 @@ class Orchestrator:
         plan, llm_meta = await llm_engine.plan(user_query, services, memory_context=memory)
         plan = _normalize_plan(plan)
         plan = _apply_safety_caps(plan)
+
+        # For aggregation queries, remove $select so all columns are fetched
+        from app.services.aggregator import detect_aggregation
+        agg_info = detect_aggregation(user_query)
+        if agg_info:
+            for step in plan.get("steps", []):
+                step["select"] = []
+                step["filter"] = ""
+                for key in list(step.keys()):
+                    if key.lower() in ("groupby", "group_by", "aggregate", "aggregation"):
+                        step.pop(key)
+            logger.info(f"Aggregation detected: {agg_info}, cleared $select/$filter for full data fetch")
         llm_provider = llm_meta.get("provider", "unknown")
         llm_latency_ms = llm_meta.get("latency_ms", 0)
         llm_tokens = llm_meta.get("tokens", 0)

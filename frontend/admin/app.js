@@ -693,6 +693,7 @@ async function loadJoins(el) {
     api("/services"),
   ]);
   window._joinServices = services;
+  window._joinList = joins;
   el.innerHTML = `
     <div class="table-wrap">
       <div class="table-header">
@@ -715,6 +716,7 @@ async function loadJoins(el) {
               <td>${j.created_at ? new Date(j.created_at).toLocaleDateString() : "—"}</td>
               <td>
                 <button class="btn btn-primary btn-sm" onclick="executeJoin('${j.id}')">Execute</button>
+                <button class="btn btn-ghost btn-sm" onclick="showEditJoin('${j.id}')">Edit</button>
                 <button class="btn btn-danger btn-sm" onclick="deleteJoin('${j.id}')">Delete</button>
               </td>
             </tr>
@@ -817,6 +819,106 @@ async function submitCreateJoin() {
   } catch (e) { toast(e.message, "error"); }
 }
 
+function showEditJoin(joinId) {
+  const joins = window._joinList || [];
+  const j = joins.find(x => x.id === joinId);
+  if (!j) return toast("Join not found", "error");
+  const services = window._joinServices || [];
+  const svcOpts = services.map(s => `<option value="${s.id}" ${s.id === j.left_service || s.id === j.right_service ? "" : ""}>${escapeHtml(s.name)} (${s.id}) — ${s.entity_sets.length} entities</option>`).join("");
+  const leftSvcOpts = services.map(s => `<option value="${s.id}" ${s.id === j.left_service ? "selected" : ""}>${escapeHtml(s.name)} (${s.id})</option>`).join("");
+  const rightSvcOpts = services.map(s => `<option value="${s.id}" ${s.id === j.right_service ? "selected" : ""}>${escapeHtml(s.name)} (${s.id})</option>`).join("");
+  const leftSvc = services.find(s => s.id === j.left_service);
+  const rightSvc = services.find(s => s.id === j.right_service);
+  const leftEntOpts = (leftSvc?.entity_sets || []).map(es => `<option value="${es}" ${es === j.left_entity ? "selected" : ""}>${es}</option>`).join("");
+  const rightEntOpts = (rightSvc?.entity_sets || []).map(es => `<option value="${es}" ${es === j.right_entity ? "selected" : ""}>${es}</option>`).join("");
+  const showKey = j.strategy === "match" || j.strategy === "enrichment";
+  showModal(`
+    <h2 style="margin:0 0 16px">Edit Join: ${escapeHtml(j.name)}</h2>
+    <div class="form-group">
+      <label>Join Name</label>
+      <input type="text" id="editJoinName" class="form-input" value="${escapeHtml(j.name)}">
+    </div>
+    <div class="form-group">
+      <label>Strategy</label>
+      <select id="editJoinStrategy" class="form-input" onchange="updateEditJoinForm()">
+        <option value="union" ${j.strategy === "union" ? "selected" : ""}>Union (Stack rows from both services)</option>
+        <option value="match" ${j.strategy === "match" ? "selected" : ""}>Match (Join by common key)</option>
+        <option value="enrichment" ${j.strategy === "enrichment" ? "selected" : ""}>Enrichment (Primary + Secondary lookup)</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Left Service</label>
+      <select id="editJoinLeftSvc" class="form-input" onchange="updateEditJoinEntities('left')">${leftSvcOpts}</select>
+    </div>
+    <div class="form-group">
+      <label>Left Entity</label>
+      <select id="editJoinLeftEntity" class="form-input">${leftEntOpts}</select>
+    </div>
+    <div class="form-group" id="editJoinLeftKeyGroup" style="${showKey ? "" : "display:none"}">
+      <label>Left Join Key</label>
+      <input type="text" id="editJoinLeftKey" class="form-input" value="${escapeHtml(j.left_key || "")}">
+    </div>
+    <div class="form-group">
+      <label>Right Service</label>
+      <select id="editJoinRightSvc" class="form-input" onchange="updateEditJoinEntities('right')">${rightSvcOpts}</select>
+    </div>
+    <div class="form-group">
+      <label>Right Entity</label>
+      <select id="editJoinRightEntity" class="form-input">${rightEntOpts}</select>
+    </div>
+    <div class="form-group" id="editJoinRightKeyGroup" style="${showKey ? "" : "display:none"}">
+      <label>Right Join Key</label>
+      <input type="text" id="editJoinRightKey" class="form-input" value="${escapeHtml(j.right_key || "")}">
+    </div>
+    <div class="form-group">
+      <label>Description</label>
+      <input type="text" id="editJoinDesc" class="form-input" value="${escapeHtml(j.description || "")}">
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="submitEditJoin('${j.id}')">Save Changes</button>
+    </div>
+  `);
+  window._editingJoinId = j.id;
+}
+
+function updateEditJoinForm() {
+  const strategy = document.getElementById("editJoinStrategy").value;
+  document.getElementById("editJoinLeftKeyGroup").style.display = (strategy === "match" || strategy === "enrichment") ? "" : "none";
+  document.getElementById("editJoinRightKeyGroup").style.display = (strategy === "match" || strategy === "enrichment") ? "" : "none";
+}
+
+function updateEditJoinEntities(side) {
+  const svcSel = document.getElementById(`editJoin${side === "left" ? "Left" : "Right"}Svc`);
+  const entSel = document.getElementById(`editJoin${side === "left" ? "Left" : "Right"}Entity`);
+  const services = window._joinServices || [];
+  const svc = services.find(s => s.id === svcSel.value);
+  const currentVal = entSel.value;
+  entSel.innerHTML = (svc?.entity_sets || []).map(es => `<option value="${es}" ${es === currentVal ? "selected" : ""}>${es}</option>`).join("");
+}
+
+async function submitEditJoin(joinId) {
+  const name = document.getElementById("editJoinName").value.trim();
+  const strategy = document.getElementById("editJoinStrategy").value;
+  const leftSvc = document.getElementById("editJoinLeftSvc").value;
+  const leftEntity = document.getElementById("editJoinLeftEntity").value;
+  const leftKey = document.getElementById("editJoinLeftKey").value.trim();
+  const rightSvc = document.getElementById("editJoinRightSvc").value;
+  const rightEntity = document.getElementById("editJoinRightEntity").value;
+  const rightKey = document.getElementById("editJoinRightKey").value.trim();
+  const desc = document.getElementById("editJoinDesc").value.trim();
+  if (!name) return toast("Name is required", "error");
+  if (!leftEntity || !rightEntity) return toast("Both entities required", "error");
+  try {
+    await api(`/joins/${joinId}`, {
+      method: "PATCH",
+      body: { name, strategy, left_service: leftSvc, left_entity: leftEntity, left_key: leftKey, right_service: rightSvc, right_entity: rightEntity, right_key: rightKey, description: desc },
+    });
+    closeModal(); toast("Join updated");
+    loadJoins(document.getElementById("pageContent"));
+  } catch (e) { toast(e.message, "error"); }
+}
+
 async function executeJoin(joinId) {
   const resultDiv = document.getElementById("joinResult");
   resultDiv.innerHTML = '<div style="text-align:center;padding:24px;color:var(--text-muted)">Loading...</div>';
@@ -890,6 +992,30 @@ async function sendJoinChat() {
     ansDiv.style.cssText = "align-self:flex-start;background:var(--bg-elev-2);padding:10px 14px;border-radius:12px 12px 12px 2px;font-size:12px;max-width:80%;border:1px solid var(--border);line-height:1.5";
     const formatted = escapeHtml(resp.answer).replace(/\n/g, "<br>").replace(/\|/g, "<span style='color:var(--text-muted)'>|</span>");
     ansDiv.innerHTML = `<div style="margin-bottom:6px;font-size:10px;color:var(--accent);font-weight:600;text-transform:uppercase">${escapeHtml(resp.provider)}</div><div>${formatted}</div>`;
+    if (resp.table && resp.table.rows && resp.table.rows.length > 0) {
+      const tWrap = document.createElement("div");
+      tWrap.style.cssText = "overflow-x:auto;margin-top:10px;max-height:400px;overflow-y:auto";
+      let thtml = '<table style="width:100%;border-collapse:collapse;font-size:11px"><thead><tr>';
+      for (const c of resp.table.columns) {
+        thtml += `<th style="padding:4px 8px;border-bottom:2px solid var(--border);text-align:left;position:sticky;top:0;background:var(--bg-elev-2)">${escapeHtml(c)}</th>`;
+      }
+      thtml += '</tr></thead><tbody>';
+      for (const r of resp.table.rows) {
+        thtml += '<tr>';
+        for (const c of resp.table.columns) {
+          const v = r[c] != null ? String(r[c]) : "";
+          thtml += `<td style="padding:3px 8px;border-bottom:1px solid var(--border);white-space:nowrap;max-width:180px;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(v)}">${escapeHtml(v)}</td>`;
+        }
+        thtml += '</tr>';
+      }
+      thtml += '</tbody></table>';
+      tWrap.innerHTML = thtml;
+      ansDiv.appendChild(tWrap);
+      const note = document.createElement("div");
+      note.style.cssText = "margin-top:6px;font-size:10px;color:var(--text-muted)";
+      note.textContent = `Showing ${resp.table.rows.length} of ${resp.table.total_count || resp.table.row_count} rows`;
+      ansDiv.appendChild(note);
+    }
     messagesEl.appendChild(ansDiv);
     messagesEl.scrollTop = messagesEl.scrollHeight;
   } catch (e) {

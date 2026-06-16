@@ -37,7 +37,7 @@ class ODataRequestBuilder:
             cleaned["select"] = [s for s in (plan["select"] or []) if re.match(r"^[A-Za-z_][A-Za-z0-9_/]*$", s)]
         if "filter" in plan and "filter" in self.allowed_ops:
             f = plan["filter"]
-            if f and isinstance(f, str) and len(f) < 1000:
+            if f and isinstance(f, str) and len(f) < 1000 and f not in ("[]", "{}", "null", "None", ""):
                 cleaned["filter"] = f
         if "expand" in plan and "expand" in self.allowed_ops:
             cleaned["expand"] = [e for e in (plan["expand"] or []) if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", e)]
