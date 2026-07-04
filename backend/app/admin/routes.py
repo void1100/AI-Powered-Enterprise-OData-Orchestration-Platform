@@ -266,6 +266,12 @@ async def get_dashboard(request: Request, user=Depends(require_permission("dashb
     }
 
 
+@router.get("/admin/usage")
+async def get_usage(request: Request, user=Depends(require_permission("dashboard"))):
+    from app.db.usage_tracker import get_usage_full
+    return get_usage_full()
+
+
 @router.get("/admin/roles")
 async def list_roles(request: Request, user=Depends(require_permission("roles"))):
     db = get_auth_db()

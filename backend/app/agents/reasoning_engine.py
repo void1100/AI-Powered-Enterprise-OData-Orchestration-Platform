@@ -489,6 +489,10 @@ class LLMReasoningEngine:
         if top is None and any(w in q.split() for w in ["all", "every"]):
             top = 100
 
+        # Smart $select: pick only useful columns from candidate_properties
+        if candidate_properties:
+            select = self._pick_smart_columns(q, candidate_properties)
+
         explicit_filters: List[str] = []
         m = re.search(r"\bwhere\s+([\w'\".= ]+?)(?:\s+(?:and|order|by|with|including|limit|top)\b|$)", q)
         if m:
@@ -570,6 +574,54 @@ class LLMReasoningEngine:
             return f"contains({m.group(1)},'{m.group(2)}')"
         return raw
 
+    # Columns that are always useful (keep these)
+    _KEEP_PATTERNS = [
+        "Material", "MaterialType", "Material_Text", "MaterialGroup",
+        "MaterialBaseUnit", "MaterialGrossWeight", "MaterialNetWeight",
+        "ManufacturingOrder", "MfgOrder", "ProductionPlant",
+        "OrderIs", "OrderOpen", "OrderStart", "OrderDelivered",
+        "Customer", "Supplier", "Product", "Category", "Price",
+        "Name", "Description", "Status", "Date", "Quantity",
+        "Country", "City", "Region",
+    ]
+
+    # Columns that are never useful (skip these)
+    _SKIP_PATTERNS = [
+        "InternalNumber", "CharcInternal", "ConfigurableProd",
+        "CrossPlantConfigurable", "ProdCharc", "Signature",
+        "PDFStandard", "CoverPage", "FormatSet", "TableColumn",
+        "MyDocument", "ValueHelp", "SeasonYear",
+    ]
+
+    def _pick_smart_columns(self, q: str, candidate_properties: List[str]) -> List[str]:
+        """Pick 5-8 most relevant columns from candidate_properties."""
+        if not candidate_properties or len(candidate_properties) <= 6:
+            return candidate_properties
+
+        scored = []
+        q_words = set(re.findall(r'[a-z]+', q.lower()))
+        for col in candidate_properties:
+            score = 0
+            col_lower = col.lower()
+            for pat in self._KEEP_PATTERNS:
+                if pat.lower() in col_lower:
+                    score += 3
+            for pat in self._SKIP_PATTERNS:
+                if pat.lower() in col_lower:
+                    score -= 10
+            for word in q_words:
+                if word in col_lower and len(word) > 2:
+                    score += 2
+            if len(col) < 25:
+                score += 1
+            scored.append((col, score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        keep = [col for col, sc in scored if sc > -5][:8]
+        if len(keep) < 5:
+            keep = [col for col, _ in scored][:6]
+        return keep
+
     def _summarize(self, query: str, steps: List[Dict[str, Any]]) -> str:
         if not steps:
             return f"I could not identify a target OData service for: '{query}'"
@@ -609,7 +661,9 @@ class LLMReasoningEngine:
             "For 'top N X by Y count/total' queries: create 2 steps — one per entity needed. The backend joins them in Python. "
             "Example: 'top 5 customers by order count' → step1: Customers (top=200), step2: Orders (top=200). "
             "OData does NOT support JOINs/GROUP BY — backend does aggregation in Python. "
-            "For prediction queries: set intent='predict', add prediction object (entity_key, features, target). No steps."
+            "For prediction queries: set intent='predict', add prediction object (entity_key, features, target). No steps. "
+            "IMPORTANT for $select: Only include columns the user actually needs. Skip empty/internal fields like *InternalNumber*, *Charc*Internal*. "
+            "Pick 5-8 most relevant columns based on the query. E.g., for 'show materials' select Material, MaterialType, Material_Text, MaterialGrossWeight."
         )
 
         suggested_services = set(s["service_id"] for s in suggestions if s.get("service_id"))
@@ -700,7 +754,9 @@ class LLMReasoningEngine:
             "For 'top N X by Y count/total' queries: create 2 steps — one per entity needed. The backend joins them in Python. "
             "Example: 'top 5 customers by order count' → step1: Customers (top=200), step2: Orders (top=200). "
             "OData does NOT support JOINs/GROUP BY — backend does aggregation in Python. "
-            "For prediction queries: set intent='predict', add prediction object (entity_key, features, target). No steps."
+            "For prediction queries: set intent='predict', add prediction object (entity_key, features, target). No steps. "
+            "IMPORTANT for $select: Only include columns the user actually needs. Skip empty/internal fields like *InternalNumber*, *Charc*Internal*. "
+            "Pick 5-8 most relevant columns based on the query. E.g., for 'show materials' select Material, MaterialType, Material_Text, MaterialGrossWeight."
         )
 
         suggested_services = set(s["service_id"] for s in suggestions if s.get("service_id"))
@@ -813,7 +869,9 @@ class LLMReasoningEngine:
             "For 'top N X by Y count/total' queries: create 2 steps — one per entity needed. The backend joins them in Python. "
             "Example: 'top 5 customers by order count' → step1: Customers (top=200), step2: Orders (top=200). "
             "OData does NOT support JOINs/GROUP BY — backend does aggregation in Python. "
-            "For prediction queries: set intent='predict', add prediction object (entity_key, features, target). No steps."
+            "For prediction queries: set intent='predict', add prediction object (entity_key, features, target). No steps. "
+            "IMPORTANT for $select: Only include columns the user actually needs. Skip empty/internal fields like *InternalNumber*, *Charc*Internal*. "
+            "Pick 5-8 most relevant columns based on the query. E.g., for 'show materials' select Material, MaterialType, Material_Text, MaterialGrossWeight."
         )
 
         suggested_services = set(s["service_id"] for s in suggestions if s.get("service_id"))
@@ -932,7 +990,9 @@ class LLMReasoningEngine:
             "For 'top N X by Y count/total' queries: create 2 steps — one per entity needed. The backend joins them in Python. "
             "Example: 'top 5 customers by order count' → step1: Customers (top=200), step2: Orders (top=200). "
             "OData does NOT support JOINs/GROUP BY — backend does aggregation in Python. "
-            "For prediction queries: set intent='predict', add prediction object (entity_key, features, target). No steps."
+            "For prediction queries: set intent='predict', add prediction object (entity_key, features, target). No steps. "
+            "IMPORTANT for $select: Only include columns the user actually needs. Skip empty/internal fields like *InternalNumber*, *Charc*Internal*. "
+            "Pick 5-8 most relevant columns based on the query. E.g., for 'show materials' select Material, MaterialType, Material_Text, MaterialGrossWeight."
         )
 
         suggested_services = set(s["service_id"] for s in suggestions if s.get("service_id"))

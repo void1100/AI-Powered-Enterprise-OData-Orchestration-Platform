@@ -11,6 +11,7 @@ from app.agents.reasoning_engine import llm_engine
 from app.agents.policy_engine import policy_engine
 from app.db.vector_store import vector_store
 from app.services.service_manager import service_manager
+from app.services.column_filter import filter_columns
 
 
 TOP_SAFETY_CAP = 200
@@ -347,6 +348,14 @@ class Orchestrator:
                 logger.info(f"RAG: Stored plan for '{user_query[:50]}' -> {primary_service}/{entity}")
             except Exception as e:
                 logger.warning(f"RAG: Failed to store plan: {e}")
+
+        # Apply column filter to remove useless columns
+        if primary_table and primary_table.get("rows"):
+            original_cols = len(primary_table.get("columns", []))
+            primary_table = filter_columns(primary_table)
+            filtered_cols = len(primary_table.get("columns", []))
+            if original_cols != filtered_cols:
+                logger.info(f"Column filter: {original_cols} -> {filtered_cols} columns")
 
         return {
             "run_id": run_id,

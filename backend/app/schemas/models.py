@@ -28,6 +28,8 @@ class ChatRequest(BaseModel):
     query: str
     session_id: Optional[str] = None
     user_role: str = "Admin"
+    selected_entities: Optional[List[Dict[str, str]]] = None
+    # [{"service_id": "sopra-po", "entity_name": "A_PurchaseOrder"}]
 
 
 class TableData(BaseModel):
@@ -89,6 +91,7 @@ class ChatResponse(BaseModel):
     drill_down_links: List[Dict[str, Any]] = []
     cached: bool = False
     intent: Optional[str] = None
+    auto_train_result: Optional[Dict[str, Any]] = None
 
 
 class SessionCreate(BaseModel):
@@ -120,3 +123,19 @@ class MCPCallRequest(BaseModel):
 
 class MCPCallResponse(BaseModel):
     result: Dict[str, Any]
+
+
+class EntitySelectRequest(BaseModel):
+    service_id: str
+    entity_name: str
+
+
+class AutoJoinRequest(BaseModel):
+    entities: List[EntitySelectRequest]
+
+
+class EntityJoinExecuteRequest(BaseModel):
+    entities: List[EntitySelectRequest]
+    joins: Optional[List[Dict[str, Any]]] = None
+    query: str = ""
+    top: int = 50

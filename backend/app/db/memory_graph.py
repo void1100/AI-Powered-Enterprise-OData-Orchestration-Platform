@@ -31,6 +31,62 @@ class InMemoryGraph:
         with self._lock:
             self.relationships.append(rel)
 
+    def upsert_entity_relationship(self, from_service: str, from_entity: str,
+                                    to_service: str, to_entity: str,
+                                    join_column: str, confidence: float = 0.9):
+        with self._lock:
+            key = (from_service, from_entity, to_service, to_entity)
+            self.relationships.append({
+                "from_service": from_service,
+                "from_name": from_entity,
+                "to_service": to_service,
+                "to_name": to_entity,
+                "join_column": join_column,
+                "confidence": confidence,
+                "rel_type": "CAN_JOIN_TO",
+            })
+
+    def get_entity_join_relationships(self, service_id: str, entity_name: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            out = []
+            for rel in self.relationships:
+                if rel.get("rel_type") == "CAN_JOIN_TO":
+                    if (rel.get("from_service") == service_id and
+                        rel.get("from_name") == entity_name):
+                        out.append({
+                            "related_service": rel.get("to_service"),
+                            "related_name": rel.get("to_name"),
+                            "join_column": rel.get("join_column"),
+                            "confidence": rel.get("confidence", 0.9),
+                        })
+            return out
+
+    def find_entity_relationships(self, entity_name: str, service_id: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            out = []
+            for rel in self.relationships:
+                if (rel.get("from_service") == service_id and
+                    rel.get("from_name") == entity_name):
+                    out.append({
+                        "related_service": rel.get("to_service"),
+                        "related_name": rel.get("to_name"),
+                        "rel_type": rel.get("rel_type", "RELATED_TO"),
+                        "join_column": rel.get("join_column"),
+                        "confidence": rel.get("confidence"),
+                        "cardinality": rel.get("cardinality"),
+                    })
+                elif (rel.get("to_service") == service_id and
+                      rel.get("to_name") == entity_name):
+                    out.append({
+                        "related_service": rel.get("from_service"),
+                        "related_name": rel.get("from_name"),
+                        "rel_type": rel.get("rel_type", "RELATED_TO"),
+                        "join_column": rel.get("join_column"),
+                        "confidence": rel.get("confidence"),
+                        "cardinality": rel.get("cardinality"),
+                    })
+            return out
+
     def upsert_role_policy(self, role: Dict[str, Any]):
         with self._lock:
             self.roles[role["id"]] = role
@@ -107,6 +163,18 @@ class InMemoryGraph:
                         "allowed_columns": ent.get("allowed_columns", []),
                         "created_by": ent.get("created_by", ""),
                         "created_at": ent.get("created_at", ""),
+                    })
+            return out
+
+    def get_service_entities(self, service_id: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            out = []
+            for (svc_id, ent_name), ent in self.entities.items():
+                if svc_id == service_id and not ent.get("is_custom"):
+                    out.append({
+                        "name": ent_name,
+                        "type": ent.get("type", ent_name),
+                        "properties": ent.get("properties", []),
                     })
             return out
 

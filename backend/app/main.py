@@ -28,6 +28,7 @@ from app.schemas.models import (
     TableData,
 )
 from app.services.service_manager import service_manager
+from app.services.column_filter import filter_columns
 from app.agents.orchestrator import orchestrator
 from app.agents.policy_engine import policy_engine
 from app.agents.reasoning_engine import llm_engine
@@ -41,6 +42,7 @@ from app.db.sqlite_store import (
     rename_session,
     touch_session,
 )
+from app.db.usage_tracker import log_usage
 from app.mcp.mcp_server import mcp_server
 
 
@@ -162,11 +164,26 @@ async def refresh_service(service_id: str, request: Request):
 
 async def _probe_service(svc: Dict[str, Any]) -> Dict[str, Any]:
     base = (svc.get("base_url") or "").rstrip("/")
-    url = f"{base}/$metadata"
+    # SAP CPI pattern: metadata=true in query string — use as-is
+    if "metadata=true" in base.lower():
+        url = base
+    else:
+        url = f"{base}/$metadata"
     t0 = time.perf_counter()
     try:
+        # Include auth headers from service registration
+        auth_type = svc.get("auth_type")
+        auth_config = svc.get("auth_config")
+        headers = {"Accept": "application/xml"}
+        if auth_type == "basic" and auth_config:
+            import base64
+            user = auth_config.get("username", "")
+            pwd = auth_config.get("password", "")
+            if user:
+                token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
+                headers["Authorization"] = f"Basic {token}"
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"Accept": "application/xml"})
+            resp = await client.get(url, headers=headers)
         latency_ms = int((time.perf_counter() - t0) * 1000)
         if resp.status_code == 200:
             status = "healthy"
@@ -198,6 +215,177 @@ async def services_health():
     services = service_manager.list_services()
     results = await asyncio.gather(*[_probe_service(s) for s in services])
     return {"services": results}
+
+
+# --- Entity Selector Endpoints ---
+
+from app.services.entity_selector import entity_selector, classify_property
+from app.schemas.models import AutoJoinRequest, EntityJoinExecuteRequest
+
+@app.get("/entities/{service_id}")
+async def get_service_entities(service_id: str):
+    """Get entity list with properties for a specific service."""
+    services = service_manager.list_services()
+    svc = next((s for s in services if s["id"] == service_id), None)
+    if not svc:
+        raise HTTPException(status_code=404, detail=f"Service '{service_id}' not found")
+    entities = []
+    for es_name in svc.get("entity_sets", []):
+        props = svc.get("entity_properties", {}).get(es_name, [])
+        labeled_props = []
+        for p in props:
+            if isinstance(p, str):
+                labeled_props.append({"name": p, "label": classify_property(p)})
+            elif isinstance(p, dict):
+                labeled_props.append({**p, "label": classify_property(p.get("name", ""))})
+            else:
+                labeled_props.append({"name": str(p), "label": "Attribute"})
+        entities.append({
+            "name": es_name,
+            "properties": labeled_props,
+            "property_count": len(labeled_props),
+        })
+    return {"service_id": service_id, "service_name": svc["name"], "entities": entities}
+
+
+@app.post("/entities/auto-join")
+async def detect_auto_joins(payload: AutoJoinRequest):
+    """Detect potential joins between selected entities."""
+    entities = []
+    services = service_manager.list_services()
+    for e in payload.entities:
+        svc = next((s for s in services if s["id"] == e.service_id), None)
+        if svc:
+            props = svc.get("entity_properties", {}).get(e.entity_name, [])
+            entities.append({
+                "service_id": e.service_id,
+                "entity_name": e.entity_name,
+                "properties": props,
+            })
+    if len(entities) < 2:
+        return {"joins": [], "message": "Select at least 2 entities to detect joins"}
+    joins = entity_selector.detect_joins(entities)
+    return {"joins": joins, "entity_count": len(entities)}
+
+
+@app.post("/entities/execute-join")
+async def execute_entity_join(payload: EntityJoinExecuteRequest):
+    """Execute a query with selected entities and auto-detected joins."""
+
+    services = service_manager.list_services()
+    all_results = []
+
+    # Fetch data for each selected entity
+    for e in payload.entities:
+        svc = next((s for s in services if s["id"] == e.service_id), None)
+        if not svc:
+            logger.warning(f"execute-join: service {e.service_id} not found")
+            continue
+        client = service_manager._clients.get(e.service_id)
+        if not client:
+            logger.warning(f"execute-join: no client for {e.service_id}")
+            continue
+        try:
+            top = min(payload.top, 200)
+            resp = await client.query(entity_set=e.entity_name, top=top)
+            rows = client.flatten_odata_value(resp)
+            if rows:
+                cols = list(rows[0].keys())
+                all_results.append({
+                    "service_id": e.service_id,
+                    "entity_name": e.entity_name,
+                    "table": {"columns": cols, "rows": rows},
+                })
+                logger.info(f"execute-join: fetched {len(rows)} rows from {e.entity_name}")
+            else:
+                logger.warning(f"execute-join: no rows from {e.entity_name}")
+        except Exception as ex:
+            logger.warning(f"execute-join: failed to fetch {e.entity_name} from {e.service_id}: {ex}")
+
+    if not all_results:
+        return {"error": "No data retrieved from selected entities", "table": TableData().model_dump(), "entity_count": 0, "join_count": 0}
+
+    # Apply joins — chain multiple joins for multi-entity scenarios
+    joins = payload.joins or []
+    if len(all_results) >= 2 and joins:
+        from app.services.cross_service_join import match_join
+        # Sort joins by confidence descending
+        sorted_joins = sorted(joins, key=lambda j: getattr(j, "confidence", 0) if hasattr(j, "confidence") else (j.get("confidence", 0) if isinstance(j, dict) else 0), reverse=True)
+        result_table = all_results[0]["table"]
+        used_right_entities = set()
+        for join_def in sorted_joins:
+            left_key = join_def.left_key if hasattr(join_def, "left_key") else join_def.get("left_key", "") if isinstance(join_def, dict) else ""
+            right_key = join_def.right_key if hasattr(join_def, "right_key") else join_def.get("right_key", "") if isinstance(join_def, dict) else ""
+            right_entity = join_def.right_entity if hasattr(join_def, "right_entity") else join_def.get("right_entity", "") if isinstance(join_def, dict) else ""
+            if not left_key or not right_key:
+                continue
+            # Find the right entity table (skip if already used)
+            right_result = None
+            for r in all_results:
+                if r["entity_name"] == right_entity and r["entity_name"] not in used_right_entities:
+                    right_result = r["table"]
+                    used_right_entities.add(r["entity_name"])
+                    break
+            if not right_result:
+                continue
+            result_table = match_join(
+                result_table,
+                right_result,
+                left_key=left_key,
+                right_key=right_key,
+                left_service=all_results[0]["service_id"],
+                right_service=right_entity,
+            )
+        columns = result_table.get("columns", [])
+        rows = result_table.get("rows", [])
+    elif len(all_results) == 1:
+        columns = all_results[0]["table"]["columns"]
+        rows = all_results[0]["table"]["rows"]
+    else:
+        all_cols = []
+        for r in all_results:
+            for c in r["table"]["columns"]:
+                if c not in all_cols:
+                    all_cols.append(c)
+        columns = all_cols
+        rows = []
+        for r in all_results:
+            for row in r["table"]["rows"]:
+                merged = {c: row.get(c) for c in all_cols}
+                merged["_source_service"] = r["service_id"]
+                rows.append(merged)
+
+    # Store successful joins for future reference
+    for j in joins:
+        le = j.left_entity if hasattr(j, "left_entity") else j.get("left_entity", "") if isinstance(j, dict) else ""
+        re_ = j.right_entity if hasattr(j, "right_entity") else j.get("right_entity", "") if isinstance(j, dict) else ""
+        lk = j.left_key if hasattr(j, "left_key") else j.get("left_key", "") if isinstance(j, dict) else ""
+        rk = j.right_key if hasattr(j, "right_key") else j.get("right_key", "") if isinstance(j, dict) else ""
+        entity_selector.store_successful_join(
+            e.service_id if payload.entities else "",
+            le,
+            e.service_id if payload.entities else "",
+            re_,
+            lk,
+            rk,
+        )
+
+    # Cap rows to prevent huge cross-products
+    MAX_JOIN_ROWS = 100
+    if len(rows) > MAX_JOIN_ROWS:
+        rows = rows[:MAX_JOIN_ROWS]
+
+    # Filter useless columns
+    filtered = filter_columns({"columns": columns, "rows": rows, "row_count": len(rows)})
+    columns, rows = filtered["columns"], filtered["rows"]
+
+    table = TableData(columns=columns, rows=rows, row_count=len(rows))
+    return {
+        "success": True,
+        "table": table.model_dump(),
+        "entity_count": len(payload.entities),
+        "join_count": len(joins),
+    }
 
 
 # --- Custom Entity Endpoints (Admin Only) ---
@@ -727,6 +915,62 @@ async def chat(payload: ChatRequest, request: Request):
     if not service_manager._services:
         await service_manager.recover_from_graph()
 
+    # Debug: log selected entities
+    if payload.selected_entities:
+        logger.info(f"Chat received {len(payload.selected_entities)} selected entities: {payload.selected_entities}")
+
+    def _do_auto_train(rows, cols):
+        """Run auto-train on fetched data. Returns auto_train_result dict or None."""
+        if len(rows) < 10:
+            return None
+        try:
+            from app.services.data_profiler import profile_table
+            from app.services.llm_insights_engine import auto_select_algorithm
+            from app.services.ml_supervised import train_model, _detect_task_type, _prepare_features, _encode_target
+            import numpy as np
+
+            profile = profile_table(rows, cols)
+            target_rec = profile.get("target_recommendation")
+            if not target_rec:
+                return None
+
+            target_col = target_rec["column"]
+
+            # Pre-validate: ensure data can actually be trained on
+            from app.services.response_sanitizer import EXCLUDE_COLUMNS
+            feature_cols = [c for c in cols if c != target_col and c not in EXCLUDE_COLUMNS]
+            X, y_raw, _ = _prepare_features(rows, feature_cols, target_col)
+            if len(X) < 5:
+                return None
+            task_type = _detect_task_type(y_raw)
+            if task_type == "classification":
+                if task_type == "classification":
+                    y_enc, _ = _encode_target(y_raw)
+                    unique, counts = np.unique(y_enc, return_counts=True)
+                    if len(unique) < 2 or min(counts) < 3:
+                        return None
+
+            algo_info = auto_select_algorithm(profile)
+            algorithm = algo_info["algorithm"]
+
+            train_result = train_model(rows, cols, target_col, algorithm)
+            if "_model" in train_result:
+                result = {
+                    "algorithm": train_result.get("algorithm", algorithm),
+                    "algorithm_key": algorithm,
+                    "target_column": target_col,
+                    "task_type": task_type,
+                    "metrics": train_result.get("metrics", {}),
+                    "sample_count": train_result.get("sample_count", len(rows)),
+                    "reason": algo_info.get("reason", ""),
+                }
+                logger.info(f"Auto-trained {algorithm} for {target_col} ({task_type}) — metrics: {train_result.get('metrics', {})}")
+                del train_result["_model"]
+                return result
+        except Exception as e:
+            logger.warning(f"Auto-training failed: {e}")
+        return None
+
     session_id = payload.session_id
     if not session_id:
         session_id = create_session(title=payload.query[:50] or "New Chat", user_role=user_role)
@@ -735,11 +979,27 @@ async def chat(payload: ChatRequest, request: Request):
 
     add_message(session_id, "user", payload.query)
 
+    def _log_chat_usage(provider: str, tokens: int, latency_ms: int, intent: str = "", cached: bool = False):
+        try:
+            log_usage(
+                provider=provider,
+                tokens=tokens,
+                latency_ms=latency_ms,
+                session_id=session_id,
+                user_query=payload.query,
+                intent=intent,
+                cached=cached,
+                user_role=user_role,
+            )
+        except Exception:
+            pass
+
     # Query cache check
     from app.services.query_enhancements import query_cache, summarize_results, recommend_charts, get_drill_down_links
     cached_result = query_cache.get(payload.query, session_id)
     if cached_result:
         cached_result["cached"] = True
+        _log_chat_usage("cached", 0, 0, intent="cached", cached=True)
         return ChatResponse(**cached_result)
 
     # Direct prediction detection (bypass LLM for prediction queries)
@@ -752,6 +1012,7 @@ async def chat(payload: ChatRequest, request: Request):
         models = model_store.list_models()
         if not models:
             # No trained model exists — guide user
+            _log_chat_usage("model_store", 0, 0, intent="predict")
             return ChatResponse(
                 run_id=str(uuid.uuid4()),
                 session_id=session_id,
@@ -862,6 +1123,7 @@ async def chat(payload: ChatRequest, request: Request):
                         f"{pred_result['confidence_info']}. "
                         f"*(Model: {best_model['algorithm']}, trained on {best_model['sample_count']} samples)*"
                     )
+                _log_chat_usage("model_store", 0, 0, intent="predict")
                 return ChatResponse(
                     run_id=str(uuid.uuid4()),
                     session_id=session_id,
@@ -885,6 +1147,255 @@ async def chat(payload: ChatRequest, request: Request):
     # Multi-entity aggregation (e.g., sales by country needs Customers+Orders+Order_Details)
     # When user mentions a service name, scope to that service only
     from app.services.multi_entity_aggregator import detect_multi_entity_query, execute_multi_entity_aggregation
+
+    # Handle selected entities: scope query to only selected entities, auto-join at runtime
+    if payload.selected_entities and len(payload.selected_entities) >= 1:
+        selected = payload.selected_entities
+        logger.info(f"Chat: {len(selected)} entities selected: {[e.get('entity_name') for e in selected]}")
+
+        # Group by service
+        svc_entities = {}
+        for e in selected:
+            sid = e.get("service_id", "")
+            ename = e.get("entity_name", "")
+            if sid and ename:
+                svc_entities.setdefault(sid, []).append(ename)
+
+        # If query needs data from multiple entities, auto-join at runtime
+        if len(selected) >= 2:
+            from app.services.entity_selector import entity_selector, classify_property
+
+            # Build entity list with properties
+            entities_for_join = []
+            for sid, enames in svc_entities.items():
+                svc = next((s for s in service_manager.list_services() if s["id"] == sid), None)
+                if not svc:
+                    continue
+                for ename in enames:
+                    props = svc.get("entity_properties", {}).get(ename, [])
+                    prop_names = []
+                    for p in props:
+                        if isinstance(p, str):
+                            prop_names.append(p)
+                        elif isinstance(p, dict):
+                            prop_names.append(p.get("name", ""))
+                    entities_for_join.append({
+                        "service_id": sid,
+                        "entity_name": ename,
+                        "properties": prop_names,
+                    })
+
+            # Auto-detect joins
+            detected_joins = entity_selector.detect_joins(entities_for_join)
+
+            # Fetch all entities in parallel
+            import asyncio
+            async def fetch_entity(sid, ename):
+                client = service_manager._clients.get(sid)
+                if not client:
+                    return None
+                try:
+                    top = 10
+                    resp = await client.query(entity_set=ename, top=top)
+                    rows = client.flatten_odata_value(resp)
+                    if rows:
+                        cols = list(rows[0].keys())
+                        logger.info(f"Chat entity join: fetched {len(rows)} rows from {ename}")
+                        return {"service_id": sid, "entity_name": ename, "table": {"columns": cols, "rows": rows}}
+                except Exception as ex:
+                    logger.warning(f"Chat entity join: failed to fetch {ename}: {ex}")
+                return None
+
+            fetch_tasks = []
+            for sid, enames in svc_entities.items():
+                for ename in enames:
+                    fetch_tasks.append(fetch_entity(sid, ename))
+
+            fetch_results = await asyncio.gather(*fetch_tasks)
+            all_results = [r for r in fetch_results if r is not None]
+
+            if all_results and detected_joins:
+                from app.services.cross_service_join import match_join
+                # Chain joins
+                sorted_joins = sorted(detected_joins, key=lambda j: -j.get("confidence", 0))
+                result_table = all_results[0]["table"]
+                used_right = set()
+                for join_def in sorted_joins:
+                    lk = join_def.get("left_key", "")
+                    rk = join_def.get("right_key", "")
+                    re = join_def.get("right_entity", "")
+                    if not lk or not rk:
+                        continue
+                    right_result = None
+                    for r in all_results:
+                        if r["entity_name"] == re and r["entity_name"] not in used_right:
+                            right_result = r["table"]
+                            used_right.add(r["entity_name"])
+                            break
+                    if right_result:
+                        result_table = match_join(
+                            result_table, right_result,
+                            left_key=lk, right_key=rk,
+                            left_service=all_results[0]["service_id"],
+                            right_service=re,
+                        )
+
+                # Cap rows
+                rows = result_table.get("rows", [])[:100]
+                columns = result_table.get("columns", [])
+
+                # Filter useless columns
+                filtered = filter_columns({"columns": columns, "rows": rows, "row_count": len(rows)})
+                columns, rows = filtered["columns"], filtered["rows"]
+
+                if rows:
+                    entity_names = [e.get("entity_name") for e in selected]
+                    summary = f"Joined {len(entity_names)} entities ({', '.join(entity_names)}): {len(rows)} rows, {len(columns)} columns"
+                    tool_calls_me = [{"type": "entity_join", "entities": entity_names, "joins": len(detected_joins), "row_count": len(rows)}]
+                    add_message(session_id, "assistant", summary, plan=None, result={"table": {"columns": columns, "rows": rows, "row_count": len(rows)}, "tool_calls": tool_calls_me})
+                    _log_chat_usage("entity_join", 0, 0, intent="entity_join")
+                    atr = _do_auto_train(rows, columns)
+                    return ChatResponse(
+                        run_id=str(uuid.uuid4()),
+                        session_id=session_id,
+                        user_query=payload.query,
+                        user_role=user_role,
+                        summary=summary,
+                        plan={"intent": "entity_join", "entities": entity_names},
+                        discovery=None,
+                        tool_calls=tool_calls_me,
+                        blocked_steps=[],
+                        table=TableData(columns=columns, rows=rows, row_count=len(rows)),
+                        primary_url=None,
+                        primary_service=selected[0].get("service_id", ""),
+                        error=None,
+                        memory_used=[],
+                        llm_provider="entity_join",
+                        llm_latency_ms=0,
+                        llm_tokens=0,
+                        auto_train_result=atr,
+                    )
+                else:
+                    # Join returned 0 rows — show individual entity results instead of falling through
+                    entity_names = [e.get("entity_name") for e in selected]
+                    combined_rows = []
+                    combined_cols = []
+                    for r in all_results:
+                        t = r["table"]
+                        if t.get("rows"):
+                            if not combined_cols:
+                                combined_cols = t["columns"]
+                            combined_rows.extend(t["rows"][:5])
+                    if combined_rows:
+                        # Filter useless columns
+                        filtered = filter_columns({"columns": combined_cols, "rows": combined_rows, "row_count": len(combined_rows)})
+                        combined_cols, combined_rows = filtered["columns"], filtered["rows"]
+                        summary = f"No matching rows found between {', '.join(entity_names)} — showing individual entity data ({len(combined_rows)} rows)"
+                        tool_calls_me = [{"type": "entity_select", "entities": entity_names, "row_count": len(combined_rows)}]
+                        add_message(session_id, "assistant", summary, plan=None, result={"table": {"columns": combined_cols, "rows": combined_rows, "row_count": len(combined_rows)}, "tool_calls": tool_calls_me})
+                        _log_chat_usage("entity_select", 0, 0, intent="entity_select")
+                        return ChatResponse(
+                            run_id=str(uuid.uuid4()),
+                            session_id=session_id,
+                            user_query=payload.query,
+                            user_role=user_role,
+                            summary=summary,
+                            plan={"intent": "entity_select", "entities": entity_names},
+                            discovery=None,
+                            tool_calls=tool_calls_me,
+                            blocked_steps=[],
+                            table=TableData(columns=combined_cols, rows=combined_rows, row_count=len(combined_rows)),
+                            primary_url=None,
+                            primary_service=selected[0].get("service_id", ""),
+                            error=None,
+                            memory_used=[],
+                            llm_provider="entity_select",
+                            llm_latency_ms=0,
+                            llm_tokens=0,
+                        )
+
+            # No joins detected or no results — still return individual entity data
+            elif all_results:
+                entity_names = [e.get("entity_name") for e in selected]
+                combined_rows = []
+                combined_cols = []
+                for r in all_results:
+                    t = r["table"]
+                    if t.get("rows"):
+                        if not combined_cols:
+                            combined_cols = t["columns"]
+                        combined_rows.extend(t["rows"][:5])
+                if combined_rows:
+                    # Filter useless columns
+                    filtered = filter_columns({"columns": combined_cols, "rows": combined_rows, "row_count": len(combined_rows)})
+                    combined_cols, combined_rows = filtered["columns"], filtered["rows"]
+                    summary = f"Selected {len(entity_names)} entities: {', '.join(entity_names)} — {len(combined_rows)} rows total"
+                    tool_calls_me = [{"type": "entity_select", "entities": entity_names, "row_count": len(combined_rows)}]
+                    add_message(session_id, "assistant", summary, plan=None, result={"table": {"columns": combined_cols, "rows": combined_rows, "row_count": len(combined_rows)}, "tool_calls": tool_calls_me})
+                    _log_chat_usage("entity_select", 0, 0, intent="entity_select")
+                    return ChatResponse(
+                        run_id=str(uuid.uuid4()),
+                        session_id=session_id,
+                        user_query=payload.query,
+                        user_role=user_role,
+                        summary=summary,
+                        plan={"intent": "entity_select", "entities": entity_names},
+                        discovery=None,
+                        tool_calls=tool_calls_me,
+                        blocked_steps=[],
+                        table=TableData(columns=combined_cols, rows=combined_rows, row_count=len(combined_rows)),
+                        primary_url=None,
+                        primary_service=selected[0].get("service_id", ""),
+                        error=None,
+                        memory_used=[],
+                        llm_provider="entity_select",
+                        llm_latency_ms=0,
+                        llm_tokens=0,
+                    )
+
+        # Single entity selected: query only that entity
+        elif len(selected) == 1:
+            sid = selected[0].get("service_id", "")
+            ename = selected[0].get("entity_name", "")
+            client = service_manager._clients.get(sid)
+            if client:
+                try:
+                    top = 10
+                    resp = await client.query(entity_set=ename, top=top)
+                    rows = client.flatten_odata_value(resp)
+                    if rows:
+                        cols = list(rows[0].keys())
+                        # Filter useless columns
+                        filtered = filter_columns({"columns": cols, "rows": rows, "row_count": len(rows)})
+                        cols, rows = filtered["columns"], filtered["rows"]
+                        summary = f"Showing {len(rows)} rows from {ename}"
+                        _log_chat_usage("entity_select", 0, 0, intent="entity_select")
+                        atr = _do_auto_train(rows, cols)
+                        tool_calls_me = [{"type": "entity_select", "service_id": sid, "entity": ename, "row_count": len(rows)}]
+                        add_message(session_id, "assistant", summary, plan=None, result={"table": {"columns": cols, "rows": rows, "row_count": len(rows)}, "tool_calls": tool_calls_me})
+                        return ChatResponse(
+                            run_id=str(uuid.uuid4()),
+                            session_id=session_id,
+                            user_query=payload.query,
+                            user_role=user_role,
+                            summary=summary,
+                            plan={"intent": "entity_select", "entity": ename},
+                            discovery=None,
+                            tool_calls=tool_calls_me,
+                            blocked_steps=[],
+                            table=TableData(columns=cols, rows=rows, row_count=len(rows)),
+                            primary_url=None,
+                            primary_service=sid,
+                            error=None,
+                            memory_used=[],
+                            llm_provider="entity_select",
+                            llm_latency_ms=0,
+                            llm_tokens=0,
+                            auto_train_result=atr,
+                        )
+                except Exception as ex:
+                    logger.warning(f"Chat entity select: failed to fetch {ename}: {ex}")
+
     services_list = service_manager.list_services()
     q_lower = payload.query.lower()
     explicit_service = None
@@ -928,6 +1439,7 @@ async def chat(payload: ChatRequest, request: Request):
                         me_chart_recs = recommend_charts(me_result.get("rows", []), me_result.get("columns", []), payload.query)
                     except Exception:
                         pass
+                    _log_chat_usage("multi_entity", 0, 0, intent="aggregate")
                     return ChatResponse(
                         run_id=str(uuid.uuid4()),
                         session_id=session_id,
@@ -1037,42 +1549,10 @@ async def chat(payload: ChatRequest, request: Request):
         except Exception as e:
             logger.warning(f"Post-processing failed: {e}")
 
-    # Auto-train model on query results for prediction capability
+    # Auto-train model on query results using data profiler + auto algorithm selection
+    auto_train_result = None
     if result.get("table") and result["table"].get("rows") and len(result["table"]["rows"]) >= 5:
-        try:
-            from app.services.model_store import model_store
-            from app.services.ml_supervised import train_model
-            table_data = result["table"]
-            cols = table_data["columns"]
-            rows = table_data["rows"]
-            numeric_cols = [c for c in cols if not c.startswith("@odata.") and c != "odata.etag"]
-            # Find best numeric target for regression
-            for col in reversed(numeric_cols):
-                try:
-                    vals = [float(r[col]) for r in rows if r.get(col) is not None]
-                    if len(vals) >= 5 and len(set(vals)) > 1:
-                        plan_data = result.get('plan') or {}
-                        entity_set = (plan_data.get('steps') or [{}])[0].get('entity_set', 'data') if plan_data.get('steps') else 'data'
-                        entity_key = f"{result.get('primary_service', 'unknown')}_{entity_set}"
-                        train_result = train_model(rows, cols, col, "random_forest")
-                        if "_model" in train_result:
-                            model_store.store(
-                                entity_key=entity_key,
-                                model_obj=train_result["_model"],
-                                feature_columns=train_result["feature_columns"],
-                                target_column=col,
-                                task_type=train_result["task_type"],
-                                metrics=train_result["metrics"],
-                                feature_importance=train_result.get("feature_importance", []),
-                                algorithm="random_forest",
-                                sample_count=train_result["sample_count"],
-                            )
-                            logger.info(f"Auto-trained model for {entity_key} targeting {col}")
-                        break
-                except (ValueError, TypeError):
-                    continue
-        except Exception as e:
-            logger.warning(f"Auto-training failed: {e}")
+        auto_train_result = _do_auto_train(result["table"]["rows"], result["table"]["columns"])
 
     # Generate chart recommendations and drill-down links
     chart_recs = []
@@ -1130,6 +1610,12 @@ async def chat(payload: ChatRequest, request: Request):
     except Exception:
         pass
 
+    _log_chat_usage(
+        provider=result.get("llm_provider", "unknown"),
+        tokens=result.get("llm_tokens", 0),
+        latency_ms=result.get("llm_latency_ms", 0),
+        intent=result.get("plan", {}).get("intent", "") if isinstance(result.get("plan"), dict) else "",
+    )
     return ChatResponse(
         run_id=result["run_id"],
         session_id=session_id,
@@ -1151,7 +1637,73 @@ async def chat(payload: ChatRequest, request: Request):
         chart_recommendations=chart_recs,
         drill_down_links=drill_links,
         intent=result.get("intent"),
+        auto_train_result=auto_train_result,
     )
+
+
+@app.post("/chat/analyze")
+async def chat_analyze(payload: ChatRequest, request: Request):
+    """On-demand insights: analyze the data from a previous query using LLM."""
+    from app.services.data_profiler import profile_table
+    from app.services.llm_insights_engine import generate_insights
+
+    user = get_current_user(request)
+    user_role = user.get("role", "user") if user else payload.user_role
+
+    # Get the last table data from the session
+    session_id = payload.session_id
+    if not session_id:
+        return {"error": "session_id required for analysis"}
+
+    messages = get_messages(session_id, limit=5)
+    # Find the last assistant message with table data
+    table_data = None
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant":
+            result = msg.get("result")
+            if result and result.get("table"):
+                table_data = result["table"]
+                break
+
+    if not table_data or not table_data.get("rows"):
+        return {"error": "No data found in session to analyze", "insights": None}
+
+    # Profile the data
+    profile = profile_table(table_data["rows"], table_data["columns"])
+
+    # Generate LLM insights
+    provider = payload.llm_provider if hasattr(payload, "llm_provider") else None
+    insights = await generate_insights(profile, payload.query, table_data, provider=provider or "auto")
+
+    # Log usage
+    try:
+        log_usage(
+            provider="llm_insights",
+            tokens=0,
+            latency_ms=0,
+            session_id=session_id,
+            user_query=payload.query,
+            intent="analyze",
+        )
+    except Exception:
+        pass
+
+    return {
+        "profile": {
+            "row_count": profile.get("row_count", 0),
+            "column_count": profile.get("column_count", 0),
+            "numeric_columns": profile.get("numeric_columns", []),
+            "categorical_columns": profile.get("categorical_columns", []),
+            "quality_score": profile.get("quality_score", 0),
+            "correlations": profile.get("correlations", []),
+            "outlier_summary": profile.get("outlier_summary", {}),
+        },
+        "insights": insights.get("insights", []),
+        "suggestions": insights.get("suggestions", []),
+        "ml_recommendation": insights.get("ml_recommendation", {}),
+        "chart_insights": insights.get("chart_insights", []),
+        "summary": insights.get("summary", ""),
+    }
 
 
 @app.get("/suggestions")
@@ -1481,9 +2033,16 @@ async def share_chat(request: Request):
             "share_text": share_text,
         }
 
+    webhook_urls = {
+        "slack": settings.n8n_webhook_url,
+        "email": settings.n8n_email_webhook_url,
+        "whatsapp": settings.n8n_whatsapp_webhook_url,
+    }
+    webhook_url = webhook_urls.get(channel, settings.n8n_webhook_url)
+
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(settings.n8n_webhook_url, json=payload)
+            resp = await client.post(webhook_url, json=payload)
             if resp.status_code >= 400:
                 logger.warning(f"n8n returned {resp.status_code}: {resp.text[:200]}")
             return {

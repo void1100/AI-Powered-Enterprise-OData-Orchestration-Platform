@@ -15,43 +15,7 @@ from app.services.odata_request_builder import ODataRequestBuilder
 from app.services.response_sanitizer import sanitize
 
 
-KNOWN_RELATIONSHIPS: Dict[str, List[Dict[str, Any]]] = {
-    "northwind": [
-        {"from": "Customers", "to": "Orders", "rel_type": "PLACES", "cardinality": "1_to_many",
-         "join_field": "CustomerID",
-         "description": "Each customer can place many orders; orders are linked back via CustomerID."},
-        {"from": "Orders", "to": "Customers", "rel_type": "PLACED_BY", "cardinality": "many_to_1",
-         "join_field": "CustomerID",
-         "description": "Each order is placed by exactly one customer (CustomerID)."},
-        {"from": "Orders", "to": "Order_Details", "rel_type": "CONTAINS", "cardinality": "1_to_many",
-         "join_field": "OrderID",
-         "description": "Each order has one or more line items in Order_Details."},
-        {"from": "Products", "to": "Order_Details", "rel_type": "INCLUDED_IN", "cardinality": "1_to_many",
-         "join_field": "ProductID",
-         "description": "Each product can appear in many order details."},
-        {"from": "Products", "to": "Categories", "rel_type": "BELONGS_TO", "cardinality": "many_to_1",
-         "join_field": "CategoryID",
-         "description": "Each product belongs to exactly one category."},
-        {"from": "Products", "to": "Suppliers", "rel_type": "SUPPLIED_BY", "cardinality": "many_to_1",
-         "join_field": "SupplierID",
-         "description": "Each product is supplied by exactly one supplier."},
-        {"from": "Suppliers", "to": "Products", "rel_type": "SUPPLIES", "cardinality": "1_to_many",
-         "join_field": "SupplierID",
-         "description": "Each supplier provides one or more products."},
-        {"from": "Categories", "to": "Products", "rel_type": "HAS", "cardinality": "1_to_many",
-         "join_field": "CategoryID",
-         "description": "Each category has one or more products."},
-        {"from": "Employees", "to": "Orders", "rel_type": "PROCESSED", "cardinality": "1_to_many",
-         "join_field": "EmployeeID",
-         "description": "Each employee can process many orders."},
-        {"from": "Shippers", "to": "Orders", "rel_type": "SHIPS", "cardinality": "1_to_many",
-         "join_field": "ShipperID",
-         "description": "Each shipper can ship many orders."},
-        {"from": "Employees", "to": "Territories", "rel_type": "ASSIGNED_TO", "cardinality": "many_to_many",
-         "join_field": "EmployeeTerritories",
-         "description": "Employees cover one or more sales territories."},
-    ],
-}
+KNOWN_RELATIONSHIPS: Dict[str, List[Dict[str, Any]]] = {}
 
 
 class ODataServiceManager:
@@ -82,6 +46,25 @@ class ODataServiceManager:
             except Exception as e:
                 logger.warning(f"Failed to fetch metadata for {name} ({base_url}): {e}")
                 meta = {"entity_types": [], "entity_sets": [], "associations": [], "namespace": ""}
+                # Try to recover entities from Neo4j (may exist from a previous registration)
+                try:
+                    g = self.graph()
+                    existing = g.get_service_entities(service_id)
+                    logger.info(f"Neo4j entity recovery for {service_id}: found {len(existing) if existing else 0} entities")
+                    if existing:
+                        logger.info(f"Recovered {len(existing)} entities for {service_id} from Neo4j")
+                        for ent in existing:
+                            meta["entity_sets"].append({"name": ent["name"], "entity_type": ent.get("type", ent["name"])})
+                            props = ent.get("properties", [])
+                            if props:
+                                et_name = ent.get("type", ent["name"]).split(".")[-1]
+                                meta["entity_types"].append({
+                                    "name": et_name,
+                                    "namespace": "",
+                                    "properties": [{"name": p, "type": "Edm.String", "nullable": True} for p in props],
+                                })
+                except Exception as ex:
+                    logger.warning(f"Failed to recover entities from Neo4j for {service_id}: {ex}")
             self._services[service_id] = {
                 "id": service_id,
                 "name": name,
@@ -370,14 +353,22 @@ class ODataServiceManager:
 
         base_url = url.split("?")[0] if "?" in url else url
 
+        top_limit = None
+        if "?" in url:
+            import re as _re
+            top_match = _re.search(r'(?:\$top|%24top)=(\d+)', url)
+            if top_match:
+                top_limit = int(top_match.group(1))
+
         # SAP CPI doesn't support $skip/$top pagination — skip it
         is_sap_cpi = client._is_sap_cpi() if hasattr(client, '_is_sap_cpi') else False
-        if not is_sap_cpi and total_count and total_count > len(rows) and total_count <= max_rows:
+        effective_max = min(max_rows, top_limit) if top_limit else max_rows
+        if not is_sap_cpi and total_count and total_count > len(rows) and total_count <= effective_max:
             page_size = len(rows) if len(rows) > 0 else 20
             skip = len(rows)
-            while skip < total_count and skip < max_rows:
+            while skip < total_count and skip < effective_max:
                 try:
-                    page_size_actual = min(page_size, max_rows - skip)
+                    page_size_actual = min(page_size, effective_max - skip)
                     page_url = f"{base_url}?$skip={skip}&$top={page_size_actual}"
                     if "$count" in url:
                         page_url += "&$count=true"
@@ -393,8 +384,10 @@ class ODataServiceManager:
                 except Exception:
                     break
 
-        if total_count and len(rows) > max_rows:
-            rows = rows[:max_rows]
+        if total_count and len(rows) > effective_max:
+            rows = rows[:effective_max]
+        elif top_limit and len(rows) > top_limit:
+            rows = rows[:top_limit]
 
         cleaned_rows = []
         for r in rows:
@@ -429,7 +422,7 @@ class ODataServiceManager:
         sanitized = {
             "columns": columns,
             "rows": cleaned_rows,
-            "row_count": total_count or len(cleaned_rows),
+            "row_count": len(cleaned_rows),
             "truncated": (total_count or len(cleaned_rows)) > len(cleaned_rows),
             "total_count": total_count,
         }

@@ -145,3 +145,59 @@ tr:hover td { background: var(--bg-hover); }
 
 /* Loading */
 .loading { text-align: center; padding: 32px; color: var(--text-muted); font-size: 13px; }
+
+/* Usage Page */
+.usage-page { display: flex; flex-direction: column; gap: 24px; }
+.usage-summary-cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.usage-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+  text-align: center;
+}
+.usage-card-rate { text-align: left; }
+.usage-card-bar { height: 6px; background: var(--bg); border-radius: 3px; margin: 8px 0; overflow: hidden; }
+.usage-card-bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+.usage-card-label { font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+.usage-card-value { font-size: 28px; font-weight: 700; color: var(--text); }
+.usage-card-sub { font-size: 12px; color: var(--text-faint); margin-top: 4px; }
+
+.usage-section { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
+.usage-section h3 { margin: 0 0 16px; font-size: 14px; color: var(--text); font-weight: 600; }
+
+/* Provider bars */
+.usage-bars { display: flex; flex-direction: column; gap: 12px; }
+.usage-bar-row { display: flex; align-items: center; gap: 12px; }
+.usage-bar-label { width: 160px; font-size: 13px; color: var(--text); white-space: nowrap; }
+.usage-bar-track { flex: 1; height: 8px; background: var(--bg); border-radius: 4px; overflow: hidden; }
+.usage-bar-fill { height: 100%; background: var(--accent); border-radius: 4px; transition: width 0.3s; }
+.usage-bar-value { width: 120px; text-align: right; font-size: 12px; color: var(--text-muted); font-family: monospace; }
+.usage-bar-cost { width: 80px; text-align: right; font-size: 12px; color: var(--green); font-family: monospace; }
+
+/* Daily chart */
+.usage-daily-chart { display: flex; align-items: flex-end; gap: 8px; height: 160px; padding-top: 8px; }
+.usage-daily-col { display: flex; flex-direction: column; align-items: center; flex: 1; height: 100%; }
+.usage-daily-bar-wrap { flex: 1; width: 100%; display: flex; align-items: flex-end; justify-content: center; }
+.usage-daily-bar { width: 70%; background: var(--accent); border-radius: 4px 4px 0 0; transition: height 0.3s; min-height: 2px; }
+.usage-daily-date { font-size: 10px; color: var(--text-faint); margin-top: 6px; }
+.usage-daily-tokens { font-size: 10px; color: var(--text-muted); font-family: monospace; }
+
+/* Usage table */
+.table-wrap { overflow-x: auto; }
+.data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.data-table th { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); color: var(--text-muted); font-weight: 500; font-size: 12px; }
+.data-table td { padding: 8px 12px; border-bottom: 1px solid var(--border); color: var(--text); }
+.data-table tr:hover td { background: var(--bg-hover); }
+.mono { font-family: monospace; }
+
+/* Badges */
+.badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; }
+.badge-blue { background: rgba(59,130,246,0.15); color: #60a5fa; }
+.badge-green { background: rgba(34,197,94,0.15); color: #4ade80; }
+.badge-yellow { background: rgba(234,179,8,0.15); color: #facc15; }
+
+@media (max-width: 768px) {
+  .usage-summary-cards { grid-template-columns: 1fr; }
+  .usage-bar-label { width: 100px; }
+}

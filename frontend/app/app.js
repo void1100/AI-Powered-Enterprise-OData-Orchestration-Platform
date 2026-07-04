@@ -169,6 +169,7 @@ function addAssistantBubble(summary, result, scroll = true, paginationInfo = nul
       div.appendChild(panel.panelEl);
       tableWrap.style.display = "";
       panel.tableView.appendChild(tableWrap);
+      panel.setTableRef(tableWrap.querySelector("table"));
       requestAnimationFrame(() => { try { panel.renderGraph(); } catch(e) { console.error("Graph render error:", e); } });
     }
   }
@@ -191,7 +192,40 @@ function addAssistantBubble(summary, result, scroll = true, paginationInfo = nul
       result.drill_down_links.map(l =>
         `<button class="drill-chip" data-query="${escapeHtml(l.query)}" title="${escapeHtml(l.description)}">${escapeHtml(l.entity)} → ${escapeHtml(l.via_column)}=${escapeHtml(l.via_value)}</button>`
       ).join("");
-    div.appendChild(drillDiv);
+      div.appendChild(drillDiv);
+  }
+  // Auto-train result
+  if (result && result.auto_train_result) {
+    const atr = result.auto_train_result;
+    const trainDiv = document.createElement("div");
+    trainDiv.className = "auto-train-badge";
+    const taskIcon = atr.task_type === "classification" ? "🏷️" : "📈";
+    const metricsText = atr.task_type === "classification"
+      ? `Accuracy: ${((atr.metrics?.accuracy || 0) * 100).toFixed(1)}%`
+      : `R²: ${(atr.metrics?.r2 || 0).toFixed(4)}`;
+    trainDiv.innerHTML = `${taskIcon} <strong>Auto-trained:</strong> ${escapeHtml(atr.algorithm)} → predict <strong>${escapeHtml(atr.target_column)}</strong> (${atr.task_type}) | ${metricsText} | ${atr.sample_count} samples`;
+    div.appendChild(trainDiv);
+  }
+  // Analyze button (on-demand insights)
+  if (result && result.tool_calls && result.tool_calls.some(t => t.type === "odata.query")) {
+    const analyzeBtn = document.createElement("button");
+    analyzeBtn.className = "analyze-btn";
+    analyzeBtn.textContent = "🔍 Analyze";
+    analyzeBtn.title = "Get AI insights about this data";
+    analyzeBtn.addEventListener("click", async () => {
+      analyzeBtn.disabled = true;
+      analyzeBtn.textContent = "Analyzing...";
+      try {
+        const data = await api("/chat/analyze", {
+          method: "POST",
+          body: { query: lastQuery, session_id: currentSessionId, user_role: roleSelect.value },
+        });
+        renderInsightsPanel(div, data);
+      } catch (e) {
+        analyzeBtn.textContent = "Error: " + e.message;
+      }
+    });
+    div.appendChild(analyzeBtn);
   }
   if (result && result.tool_calls && result.tool_calls.length) {
     const hasQuery = result.tool_calls.some(t => t.type === "odata.query");
@@ -234,6 +268,65 @@ function addAssistantBubble(summary, result, scroll = true, paginationInfo = nul
   if (scroll) messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
+function renderInsightsPanel(bubbleDiv, data) {
+  const existing = bubbleDiv.querySelector(".insights-panel");
+  if (existing) existing.remove();
+
+  const panel = document.createElement("div");
+  panel.className = "insights-panel";
+
+  let html = "";
+
+  if (data.summary) {
+    html += `<div class="insights-summary">${escapeHtml(data.summary)}</div>`;
+  }
+
+  if (data.profile) {
+    const p = data.profile;
+    html += `<div class="insights-profile">
+      <span class="insight-stat">${p.row_count} rows</span>
+      <span class="insight-stat">${p.column_count} columns</span>
+      <span class="insight-stat">${p.numeric_columns?.length || 0} numeric</span>
+      <span class="insight-stat">${p.categorical_columns?.length || 0} categorical</span>
+      <span class="insight-stat">Quality: ${p.quality_score}/100</span>
+    </div>`;
+  }
+
+  if (data.insights && data.insights.length) {
+    html += `<div class="insights-section"><div class="insights-label">Data Insights</div><ul>`;
+    data.insights.forEach(i => { html += `<li>${escapeHtml(i)}</li>`; });
+    html += `</ul></div>`;
+  }
+
+  if (data.ml_recommendation && data.ml_recommendation.algorithm) {
+    const ml = data.ml_recommendation;
+    html += `<div class="insights-section insights-ml">
+      <div class="insights-label">ML Recommendation</div>
+      <div class="insights-ml-detail">
+        <strong>${escapeHtml(ml.algorithm)}</strong> for <strong>${escapeHtml(ml.target_column || "N/A")}</strong>
+        (${ml.task_type}) - ${escapeHtml(ml.reason || "")}
+      </div>
+    </div>`;
+  }
+
+  if (data.chart_insights && data.chart_insights.length) {
+    html += `<div class="insights-section"><div class="insights-label">Chart Suggestions</div><ul>`;
+    data.chart_insights.forEach(c => { html += `<li>${escapeHtml(c)}</li>`; });
+    html += `</ul></div>`;
+  }
+
+  if (data.suggestions && data.suggestions.length) {
+    html += `<div class="insights-section"><div class="insights-label">Try Next</div><div class="insights-suggestions">`;
+    data.suggestions.forEach(s => {
+      html += `<button class="insight-suggestion-chip" onclick="document.getElementById('queryInput').value='${escapeHtml(s)}';document.getElementById('queryInput').focus()">${escapeHtml(s)}</button>`;
+    });
+    html += `</div></div>`;
+  }
+
+  panel.innerHTML = html;
+  bubbleDiv.appendChild(panel);
+}
+
 function tableToCsv(table) {
   const escape = (v) => {
     if (v == null) return "";
@@ -244,6 +337,19 @@ function tableToCsv(table) {
   const head = table.columns.map(escape).join(",");
   const body = table.rows.map((r) => table.columns.map((c) => escape(r[c])).join(",")).join("\r\n");
   return head + "\r\n" + body;
+}
+
+function updateTableVisibility(tableEl, allColumns, hiddenCols) {
+  const ths = tableEl.querySelectorAll("thead th");
+  ths.forEach((th, i) => {
+    th.style.display = hiddenCols.has(allColumns[i]) ? "none" : "";
+  });
+  tableEl.querySelectorAll("tbody tr").forEach((tr) => {
+    const tds = tr.querySelectorAll("td");
+    tds.forEach((td, i) => {
+      td.style.display = hiddenCols.has(allColumns[i]) ? "none" : "";
+    });
+  });
 }
 
 function downloadCsv(table, label) {
@@ -281,6 +387,7 @@ function renderTable(table, paginationInfo = null) {
   wrap.className = "table-wrapper";
   const toolbar = document.createElement("div");
   toolbar.className = "table-toolbar";
+
   const csvBtn = document.createElement("button");
   csvBtn.className = "csv-btn";
   csvBtn.textContent = "Download CSV";
@@ -1306,6 +1413,57 @@ function buildResultPanel(table) {
   panelEl.className = "result-panel";
   const tabsEl = document.createElement("div");
   tabsEl.className = "result-tabs";
+
+  // Column picker in header
+  // Column toggle button — shows all columns or only filtered
+  const allColumns = [...table.columns];
+  const tableRef = { el: null };
+  let showingAll = false;
+
+  const colBtn = document.createElement("button");
+  colBtn.className = "col-toggle-btn";
+  colBtn.textContent = `Show All Columns (${allColumns.length})`;
+  colBtn.title = "Toggle all columns on/off";
+  colBtn.addEventListener("click", () => {
+    if (!tableRef.el) return;
+    showingAll = !showingAll;
+    if (showingAll) {
+      // Show all columns — unhide everything
+      updateTableVisibility(tableRef.el, allColumns, new Set());
+      colBtn.textContent = `Show Filtered (${allColumns.length})`;
+      colBtn.classList.add("active");
+    } else {
+      // Re-apply filter — hide useless columns
+      const useless = new Set();
+      const rows = [];
+      const trs = tableRef.el.querySelectorAll("tbody tr");
+      trs.forEach(tr => {
+        const row = {};
+        const tds = tr.querySelectorAll("td");
+        tds.forEach((td, i) => { row[allColumns[i]] = td.textContent; });
+        rows.push(row);
+      });
+      allColumns.forEach(col => {
+        if (isUselessCol(col, rows)) useless.add(col);
+      });
+      updateTableVisibility(tableRef.el, allColumns, useless);
+      colBtn.textContent = `Show All Columns (${allColumns.length})`;
+      colBtn.classList.remove("active");
+    }
+  });
+  tabsEl.appendChild(colBtn);
+
+  function isUselessCol(col, rows) {
+    if (!rows.length) return false;
+    const vals = rows.map(r => (r[col] || "").trim());
+    const unique = new Set(vals);
+    if (unique.size <= 1) return true;
+    const empty = vals.filter(v => v === "" || v === "0" || v === "0.0" || v === "0.00" || v.startsWith("000000000")).length;
+    if (empty / vals.length >= 0.95) return true;
+    if (/InternalNumber|CharcInternal|ConfigurableProd|ProdCharc/i.test(col)) return true;
+    return false;
+  }
+
   const tableTab = document.createElement("button");
   tableTab.className = "result-tab active";
   tableTab.dataset.view = "table";
@@ -1453,7 +1611,7 @@ function buildResultPanel(table) {
       analyzeView.dataset.loaded = "1";
     }
   });
-  return { panelEl, tableView, renderGraph };
+  return { panelEl, tableView, renderGraph, setTableRef: (el) => { tableRef.el = el; } };
 }
 
 function rerenderAllCharts() {
@@ -1545,6 +1703,7 @@ async function send() {
         query: q,
         session_id: currentSessionId,
         user_role: roleSelect.value,
+        selected_entities: selectedEntities.length > 0 ? selectedEntities : undefined,
       },
     });
     removeProcessingBubble();
@@ -1913,26 +2072,22 @@ document.querySelectorAll(".share-channel-btn").forEach((btn) => {
         text += lastTable.rows.slice(0, 20).map((r) => cols.map((c) => r[c] ?? "").join(" | ")).join("\n");
         if (lastTable.rows.length > 20) text += `\n... and ${lastTable.rows.length - 20} more rows`;
       }
-      if (channel === "email") {
-        window.open(`mailto:?subject=Chat Result&body=${encodeURIComponent(text)}`, "_blank");
-        shareStatus.textContent = "Opened email client!";
-        shareStatus.className = "share-status success";
-      } else if (channel === "whatsapp") {
-        window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, "_blank");
-        shareStatus.textContent = "Opened WhatsApp!";
-        shareStatus.className = "share-status success";
-      } else if (channel === "slack") {
-        try {
-          const resp = await api("/share", {
-            method: "POST",
-            body: { channel, query: lastQuery, summary: lastSummary, table: lastTable, session_id: currentSessionId || "" },
-          });
-          shareStatus.textContent = resp.success ? "Shared to Slack!" : `Slack share failed: ${resp.detail || "n8n workflow not configured"}`;
-          shareStatus.className = resp.success ? "share-status success" : "share-status error";
-        } catch (e) {
-          shareStatus.textContent = "Slack requires n8n webhook. Copy text and paste manually.";
+      try {
+        const resp = await api("/share", {
+          method: "POST",
+          body: { channel, query: lastQuery, summary: lastSummary, table: lastTable, session_id: currentSessionId || "" },
+        });
+        if (resp.success) {
+          const labels = { email: "Email sent!", whatsapp: "WhatsApp sent!", slack: "Shared to Slack!" };
+          shareStatus.textContent = labels[channel] || "Shared!";
+          shareStatus.className = "share-status success";
+        } else {
+          shareStatus.textContent = `${channel} failed: ${resp.detail || "n8n workflow not configured"}`;
           shareStatus.className = "share-status error";
         }
+      } catch (e) {
+        shareStatus.textContent = `${channel} requires n8n webhook. Check n8n is running.`;
+        shareStatus.className = "share-status error";
       }
       return;
     }
@@ -1946,3 +2101,226 @@ function addAssistantBubbleTracked(summary, result, scroll, paginationInfo) {
     trackLastMessage(lastQuery, summary, result.table);
   }
 }
+
+// ==================== ENTITY SELECTOR ====================
+
+let entityPanelOpen = false;
+let allServices = [];
+let selectedEntities = [];
+let detectedJoins = [];
+let currentEntityService = null;
+
+const entityPanel = $("entityPanel");
+const entitySelectorBtn = $("entitySelectorBtn");
+const closeEntityPanel = $("closeEntityPanel");
+const entityServiceTabs = $("entityServiceTabs");
+const entitySearch = $("entitySearch");
+const entityList = $("entityList");
+const detectedJoinsEl = $("detectedJoins");
+const entitySelectedCount = $("entitySelectedCount");
+const executeEntityJoinBtn = $("executeEntityJoin");
+
+entitySelectorBtn.addEventListener("click", toggleEntityPanel);
+closeEntityPanel.addEventListener("click", () => {
+  entityPanel.classList.add("hidden");
+  entityPanelOpen = false;
+});
+
+function toggleEntityPanel() {
+  entityPanelOpen = !entityPanelOpen;
+  entityPanel.classList.toggle("hidden", !entityPanelOpen);
+  if (entityPanelOpen && allServices.length === 0) {
+    loadEntityServices();
+  }
+}
+
+async function loadEntityServices() {
+  try {
+    allServices = await api("/services");
+    renderServiceTabs();
+    if (allServices.length > 0) {
+      selectEntityService(allServices[0].id);
+    }
+  } catch (e) {
+    console.error("Failed to load services for entity selector", e);
+  }
+}
+
+function renderServiceTabs() {
+  entityServiceTabs.innerHTML = "";
+  allServices.forEach((svc) => {
+    const tab = document.createElement("button");
+    tab.className = "entity-service-tab" + (svc.id === currentEntityService ? " active" : "");
+    tab.textContent = svc.name;
+    tab.dataset.serviceId = svc.id;
+    tab.addEventListener("click", () => selectEntityService(svc.id));
+    entityServiceTabs.appendChild(tab);
+  });
+}
+
+async function selectEntityService(serviceId) {
+  currentEntityService = serviceId;
+  renderServiceTabs();
+  entitySearch.value = "";
+  try {
+    const data = await api(`/entities/${serviceId}`);
+    renderEntityList(data.entities || []);
+  } catch (e) {
+    entityList.innerHTML = `<div style="padding:10px;color:var(--text-muted)">Failed to load entities</div>`;
+  }
+}
+
+function renderEntityList(entities) {
+  entityList.innerHTML = "";
+  const search = entitySearch.value.toLowerCase();
+  const filtered = search
+    ? entities.filter((e) => e.name.toLowerCase().includes(search))
+    : entities;
+  filtered.forEach((ent) => {
+    const isSelected = selectedEntities.some(
+      (s) => s.service_id === currentEntityService && s.entity_name === ent.name
+    );
+    // Count property labels
+    const props = ent.properties || [];
+    const labelCounts = {};
+    props.forEach((p) => {
+      const lbl = typeof p === "object" ? (p.label || "Attribute") : "Attribute";
+      labelCounts[lbl] = (labelCounts[lbl] || 0) + 1;
+    });
+    const labelTags = Object.entries(labelCounts)
+      .map(([lbl, cnt]) => `<span class="prop-label-tag prop-label-${lbl.toLowerCase()}">${lbl}: ${cnt}</span>`)
+      .join("");
+    const item = document.createElement("label");
+    item.className = "entity-checkbox-item";
+    item.innerHTML = `
+      <input type="checkbox" ${isSelected ? "checked" : ""} data-entity="${ent.name}" />
+      <span>${escapeHtml(ent.name)}</span>
+      <span class="entity-props">${ent.property_count} props</span>
+      <div class="prop-labels">${labelTags}</div>
+    `;
+    const checkbox = item.querySelector("input");
+    checkbox.addEventListener("change", () => {
+      toggleEntity(currentEntityService, ent.name, ent.properties, checkbox.checked);
+    });
+    entityList.appendChild(item);
+  });
+  if (filtered.length === 0) {
+    entityList.innerHTML = `<div style="padding:10px;color:var(--text-muted)">No entities found</div>`;
+  }
+}
+
+entitySearch.addEventListener("input", async () => {
+  if (!currentEntityService) return;
+  try {
+    const data = await api(`/entities/${currentEntityService}`);
+    renderEntityList(data.entities || []);
+  } catch (e) {}
+});
+
+function toggleEntity(serviceId, entityName, properties, checked) {
+  if (checked) {
+    if (!selectedEntities.some((s) => s.service_id === serviceId && s.entity_name === entityName)) {
+      selectedEntities.push({ service_id: serviceId, entity_name: entityName, properties: properties || [] });
+    }
+  } else {
+    selectedEntities = selectedEntities.filter(
+      (s) => !(s.service_id === serviceId && s.entity_name === entityName)
+    );
+  }
+  updateEntityCount();
+  detectJoinsFromSelection();
+}
+
+function updateEntityCount() {
+  const count = selectedEntities.length;
+  if (count === 0) {
+    entitySelectedCount.textContent = "No entities selected";
+    entitySelectedCount.className = "";
+  } else if (count === 1) {
+    entitySelectedCount.textContent = "1 entity selected — will query this entity in chat";
+    entitySelectedCount.className = "entity-status-active";
+  } else {
+    entitySelectedCount.textContent = `${count} entities selected — will auto-join in chat`;
+    entitySelectedCount.className = "entity-status-active";
+  }
+  executeEntityJoinBtn.disabled = count < 2;
+  executeEntityJoinBtn.textContent = count < 2 ? "Select 2+ to join" : "Execute Join (optional)";
+}
+
+async function detectJoinsFromSelection() {
+  if (selectedEntities.length < 2) {
+    detectedJoins = [];
+    renderDetectedJoins();
+    return;
+  }
+  try {
+    const resp = await api("/entities/auto-join", {
+      method: "POST",
+      body: { entities: selectedEntities },
+    });
+    detectedJoins = resp.joins || [];
+    renderDetectedJoins();
+  } catch (e) {
+    detectedJoins = [];
+    renderDetectedJoins();
+  }
+}
+
+function renderDetectedJoins() {
+  if (detectedJoins.length === 0) {
+    detectedJoinsEl.innerHTML = "";
+    return;
+  }
+  const labelNames = { primary_key: "Primary Key", foreign_key: "Foreign Key", attribute: "Attribute", fuzzy: "Fuzzy", neo4j: "Confirmed" };
+  let html = `<div class="detected-joins-title">Detected Joins (${detectedJoins.length})</div>`;
+  detectedJoins.forEach((j) => {
+    const label = j.label || "attribute";
+    const labelName = labelNames[label] || label;
+    html += `
+      <div class="join-item join-item-${label}">
+        <span class="join-label join-label-${label}">${escapeHtml(labelName)}</span>
+        <span class="join-key">${escapeHtml(j.left_entity)}.${escapeHtml(j.left_key)}</span>
+        <span>=</span>
+        <span class="join-key">${escapeHtml(j.right_entity)}.${escapeHtml(j.right_key)}</span>
+        <span class="join-confidence">${Math.round(j.confidence * 100)}%</span>
+      </div>
+    `;
+  });
+  detectedJoinsEl.innerHTML = html;
+}
+
+executeEntityJoinBtn.addEventListener("click", async () => {
+  if (selectedEntities.length === 0) return;
+  const query = $("queryInput").value.trim() || `Show data from ${selectedEntities.map((e) => e.entity_name).join(" and ")}`;
+  executeEntityJoinBtn.disabled = true;
+  executeEntityJoinBtn.textContent = "Executing...";
+  try {
+    addProcessingBubble("Executing entity join...");
+    const resp = await api("/entities/execute-join", {
+      method: "POST",
+      body: {
+        entities: selectedEntities,
+        joins: detectedJoins,
+        query: query,
+        top: 10,
+      },
+    });
+    removeProcessingBubble();
+    if (resp.error) {
+      addAssistantBubble(resp.error, null, true);
+    } else {
+      const rowCount = resp.table?.row_count || 0;
+      let summary = `Joined ${resp.entity_count} entities with ${resp.join_count} join(s). Found ${rowCount} rows.`;
+      if (rowCount === 0) {
+        summary += " No matching rows found between the selected entities. Try selecting different entities or adjusting the join key.";
+      }
+      addAssistantBubble(summary, resp, true);
+    }
+  } catch (e) {
+    removeProcessingBubble();
+    addAssistantBubble(`Entity join failed: ${e.message}`, null, true);
+  }
+  executeEntityJoinBtn.disabled = false;
+  executeEntityJoinBtn.textContent = "Execute Join";
+  updateEntityCount();
+});

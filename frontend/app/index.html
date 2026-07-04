@@ -50,6 +50,7 @@
       <header class="topbar">
         <h1>Advanced OData Service Orchestration</h1>
         <div class="topbar-actions">
+          <button id="entitySelectorBtn" class="icon-btn" title="Select Entities">Select Entities</button>
           <button id="themeToggle" class="icon-btn" title="Toggle dark mode" aria-label="Toggle dark mode">
             <span class="theme-icon-light">☀</span>
             <span class="theme-icon-dark">☾</span>
@@ -133,6 +134,29 @@
           <button type="submit">Register</button>
         </form>
         <ul id="serviceList" class="service-list"></ul>
+      </div>
+    </div>
+
+    <!-- Entity Selector Panel -->
+    <div id="entityPanel" class="entity-panel hidden">
+      <div class="entity-panel-header">
+        <h3>Select Entities</h3>
+        <button id="closeEntityPanel" class="close-btn">x</button>
+      </div>
+      <div class="entity-panel-body">
+        <!-- Service tabs -->
+        <div id="entityServiceTabs" class="entity-service-tabs"></div>
+        <!-- Search -->
+        <input type="text" id="entitySearch" class="entity-search" placeholder="Search entities..." />
+        <!-- Entity list -->
+        <div id="entityList" class="entity-checkbox-list"></div>
+        <!-- Detected joins -->
+        <div id="detectedJoins" class="detected-joins"></div>
+        <!-- Selected count + execute -->
+        <div class="entity-panel-footer">
+          <span id="entitySelectedCount">0 entities selected</span>
+          <button id="executeEntityJoin" class="execute-join-btn" disabled>Execute Join</button>
+        </div>
       </div>
     </div>
   </div>

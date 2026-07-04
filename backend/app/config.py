@@ -35,6 +35,16 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000,http://localhost:5173"
 
     n8n_webhook_url: str = "http://n8n:5678/webhook/chat-share"
+    n8n_email_webhook_url: str = "http://n8n:5678/webhook/email-share"
+    n8n_whatsapp_webhook_url: str = "http://n8n:5678/webhook/whatsapp-share"
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+    twilio_whatsapp_number: str = ""
 
     @property
     def cors_origins_list(self) -> List[str]:

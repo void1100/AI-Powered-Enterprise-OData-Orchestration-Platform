@@ -137,6 +137,67 @@ class Neo4jClient:
                 description=rel.get("description", ""),
             )
 
+    def upsert_entity_relationship(self, from_service: str, from_entity: str,
+                                    to_service: str, to_entity: str,
+                                    join_column: str, confidence: float = 0.9):
+        """Store a detected join relationship between two entities."""
+        if not self._driver:
+            return
+        with self._driver.session() as session:
+            session.run(
+                """
+                MATCH (a:Entity {service: $from_service, name: $from_entity})
+                MATCH (b:Entity {service: $to_service, name: $to_entity})
+                MERGE (a)-[r:CAN_JOIN_TO]->(b)
+                SET r.join_column = $join_column,
+                    r.confidence = $confidence
+                """,
+                from_service=from_service,
+                from_entity=from_entity,
+                to_service=to_service,
+                to_entity=to_entity,
+                join_column=join_column,
+                confidence=confidence,
+            )
+
+    def get_entity_join_relationships(self, service_id: str, entity_name: str) -> List[Dict[str, Any]]:
+        """Get all CAN_JOIN_TO relationships for an entity."""
+        if not self._driver:
+            return []
+        with self._driver.session() as session:
+            result = session.run(
+                """
+                MATCH (e:Entity {service: $service_id, name: $entity_name})-[r:CAN_JOIN_TO]->(other:Entity)
+                RETURN other.service AS related_service,
+                       other.name AS related_name,
+                       r.join_column AS join_column,
+                       r.confidence AS confidence
+                """,
+                service_id=service_id,
+                entity_name=entity_name,
+            )
+            return [dict(r) for r in result]
+
+    def find_entity_relationships(self, entity_name: str, service_id: str) -> List[Dict[str, Any]]:
+        """Find all relationships for an entity (both directions)."""
+        if not self._driver:
+            return []
+        with self._driver.session() as session:
+            result = session.run(
+                """
+                MATCH (e:Entity {service: $service_id, name: $entity_name})-[r:RELATED_TO|CAN_JOIN_TO]-(other:Entity)
+                RETURN other.service AS related_service,
+                       other.name AS related_name,
+                       type(r) AS rel_type,
+                       r.join_column AS join_column,
+                       r.confidence AS confidence,
+                       r.cardinality AS cardinality
+                """,
+                service_id=service_id,
+                entity_name=entity_name,
+            )
+            return [dict(r) for r in result]
+
     def upsert_role_policy(self, role: Dict[str, Any]):
         if not self._driver:
             return
@@ -169,6 +230,21 @@ class Neo4jClient:
                        e.allowed_columns AS allowed_columns, e.created_by AS created_by,
                        e.created_at AS created_at
                 """
+            )
+            return [dict(r) for r in result]
+
+    def get_service_entities(self, service_id: str) -> List[Dict[str, Any]]:
+        """Get all entities for a service from Neo4j (used when metadata fetch fails)."""
+        if not self._driver:
+            return []
+        with self._driver.session() as session:
+            result = session.run(
+                """
+                MATCH (s:Service)-[:HAS_ENTITY]->(e:Entity)
+                WHERE s.id = $service_id AND (e.is_custom = false OR e.is_custom = 'false')
+                RETURN e.name AS name, e.type AS type, e.properties AS properties
+                """,
+                service_id=service_id,
             )
             return [dict(r) for r in result]
 

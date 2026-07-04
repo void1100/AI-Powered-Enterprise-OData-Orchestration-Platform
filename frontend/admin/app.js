@@ -91,6 +91,7 @@ function navigateTo(page) {
     custom_entities: "Custom Entities",
     joins: "Join Services",
     analytics: "Analytics",
+    usage: "Usage",
     audit: "Audit Log",
     settings: "System Settings",
   }[page] || page;
@@ -108,6 +109,7 @@ async function loadPage(page) {
     else if (page === "custom_entities") await loadCustomEntities(content);
     else if (page === "joins") await loadJoins(content);
     else if (page === "analytics") await loadAnalytics(content);
+    else if (page === "usage") await loadUsage(content);
     else if (page === "audit") await loadAudit(content);
     else if (page === "settings") await loadSettings(content);
   } catch (e) {
@@ -1151,6 +1153,150 @@ async function saveSettings(e) {
   } catch (e) { toast(e.message, "error"); }
 }
 
+// --- Usage ---
+async function loadUsage(el) {
+  try {
+    const data = await api("/admin/usage");
+    const today = data.today || {};
+    const byProvider = data.by_provider || [];
+    const recentQueries = data.recent_queries || [];
+    const dailyAvg = data.daily_average || {};
+    const thisWeek = data.this_week || [];
+    const rateLimits = data.rate_limits || [];
+
+    const totalTokensToday = today.total_tokens || 0;
+    const totalQueriesToday = today.total_queries || 0;
+    const avgDaily = dailyAvg.avg_daily_tokens || 0;
+
+    // Build rate limit cards
+    const rateLimitCards = rateLimits.map(r => {
+      const statusColor = r.status === "ok" ? "green" : r.status === "warning" ? "yellow" : "red";
+      return `
+        <div class="usage-card usage-card-rate">
+          <div class="usage-card-label">${escapeHtml(r.label)}</div>
+          <div class="usage-card-value">${r.usage_percent}%</div>
+          <div class="usage-card-bar">
+            <div class="usage-card-bar-fill" style="width:${r.usage_percent}%;background:var(--${statusColor})"></div>
+          </div>
+          <div class="usage-card-sub">${formatNum(r.used_today)} / ${formatNum(r.daily_limit)} tokens</div>
+          <div class="usage-card-sub">${r.rpm_limit} RPM limit</div>
+        </div>`;
+    }).join("");
+
+    // Build bar chart for providers
+    const maxTokens = Math.max(...byProvider.map(p => p.total_tokens), 1);
+    const providerBars = byProvider.map(p => {
+      const pct = Math.round((p.total_tokens / maxTokens) * 100);
+      const cost = p.estimated_cost !== undefined ? `$${p.estimated_cost.toFixed(4)}` : "";
+      return `
+        <div class="usage-bar-row">
+          <span class="usage-bar-label">${escapeHtml(p.label || p.provider)}</span>
+          <div class="usage-bar-track">
+            <div class="usage-bar-fill" style="width:${pct}%"></div>
+          </div>
+          <span class="usage-bar-value">${formatNum(p.total_tokens)} tokens</span>
+          <span class="usage-bar-cost">${cost}</span>
+        </div>`;
+    }).join("");
+
+    // Build daily chart (last 7 days)
+    const weekMax = Math.max(...thisWeek.map(d => d.tokens), 1);
+    const dailyBars = thisWeek.map(d => {
+      const pct = Math.round((d.tokens / weekMax) * 100);
+      const date = d.date.slice(5);
+      return `
+        <div class="usage-daily-col">
+          <div class="usage-daily-bar-wrap">
+            <div class="usage-daily-bar" style="height:${Math.max(pct, 2)}%"></div>
+          </div>
+          <span class="usage-daily-date">${date}</span>
+          <span class="usage-daily-tokens">${formatNum(d.tokens)}</span>
+        </div>`;
+    }).join("");
+
+    // Recent queries table
+    const rows = recentQueries.map(q => {
+      const ts = q.timestamp ? new Date(q.timestamp).toLocaleString() : "";
+      const truncQuery = (q.user_query || "").length > 60 ? (q.user_query || "").slice(0, 60) + "..." : (q.user_query || "");
+      const cached = q.cached ? '<span class="badge badge-green">Cached</span>' : "";
+      return `
+        <tr>
+          <td class="mono">${ts}</td>
+          <td>${escapeHtml(truncQuery)}</td>
+          <td><span class="badge badge-blue">${escapeHtml(q.provider || "")}</span></td>
+          <td class="mono">${formatNum(q.tokens)}</td>
+          <td class="mono">${q.latency_ms || 0}ms</td>
+          <td>${cached}</td>
+        </tr>`;
+    }).join("");
+
+    el.innerHTML = `
+      <div class="usage-page">
+        <div class="usage-summary-cards">
+          <div class="usage-card">
+            <div class="usage-card-label">Today</div>
+            <div class="usage-card-value">${formatNum(totalTokensToday)}</div>
+            <div class="usage-card-sub">${totalQueriesToday} queries</div>
+          </div>
+          <div class="usage-card">
+            <div class="usage-card-label">7-Day Average</div>
+            <div class="usage-card-value">${formatNum(avgDaily)}</div>
+            <div class="usage-card-sub">tokens/day</div>
+          </div>
+          <div class="usage-card">
+            <div class="usage-card-label">This Week</div>
+            <div class="usage-card-value">${formatNum(thisWeek.reduce((s, d) => s + d.tokens, 0))}</div>
+            <div class="usage-card-sub">${thisWeek.reduce((s, d) => s + d.queries, 0)} queries</div>
+          </div>
+        </div>
+
+        <div class="usage-section">
+          <h3>Provider Rate Limits (Today)</h3>
+          <div class="usage-summary-cards">${rateLimitCards || '<div class="empty-state">No data yet</div>'}</div>
+        </div>
+
+        <div class="usage-section">
+          <h3>Usage by Provider</h3>
+          <div class="usage-bars">${providerBars || '<div class="empty-state">No data yet</div>'}</div>
+        </div>
+
+        <div class="usage-section">
+          <h3>Daily Usage (Last 7 Days)</h3>
+          <div class="usage-daily-chart">${dailyBars || '<div class="empty-state">No data yet</div>'}</div>
+        </div>
+
+        <div class="usage-section">
+          <h3>Recent Queries</h3>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Query</th>
+                  <th>Provider</th>
+                  <th>Tokens</th>
+                  <th>Latency</th>
+                  <th>Cached</th>
+                </tr>
+              </thead>
+              <tbody>${rows || '<tr><td colspan="6" class="empty-state">No queries yet</td></tr>'}</tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    `;
+  } catch (e) {
+    el.innerHTML = `<div class="empty-state"><p>Error loading usage: ${escapeHtml(e.message)}</p></div>`;
+  }
+}
+
+function formatNum(n) {
+  if (n === 0) return "0";
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
+  if (n >= 1000) return (n / 1000).toFixed(1) + "K";
+  return String(n);
+}
+
 // --- Audit ---
 async function loadAudit(el) {
   const logs = await api("/admin/audit?limit=200");
@@ -1206,9 +1352,9 @@ async function init() {
 }
 
 const ROLE_PERMISSIONS = {
-  super_admin: ["dashboard", "users", "roles", "services", "custom_entities", "joins", "analytics", "audit", "settings"],
-  admin: ["dashboard", "users", "roles", "services", "custom_entities", "joins", "analytics", "audit", "settings"],
-  analyst: ["dashboard", "analytics", "services"],
+  super_admin: ["dashboard", "users", "roles", "services", "custom_entities", "joins", "analytics", "usage", "audit", "settings"],
+  admin: ["dashboard", "users", "roles", "services", "custom_entities", "joins", "analytics", "usage", "audit", "settings"],
+  analyst: ["dashboard", "analytics", "usage", "services"],
   user: ["dashboard"],
   viewer: ["dashboard"],
 };

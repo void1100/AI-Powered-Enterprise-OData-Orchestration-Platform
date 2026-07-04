@@ -22,21 +22,6 @@ services:
       start_period: 30s
       retries: 10
 
-  sample-odata:
-    build:
-      context: .
-      dockerfile: sample_odata_service/Dockerfile
-    container_name: odata-sample
-    restart: unless-stopped
-    ports:
-      - "5000:5000"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS 'http://localhost:5000/Customers?$top=1' || exit 1"]
-      interval: 30s
-      timeout: 5s
-      start_period: 10s
-      retries: 3
-
   backend:
     build:
       context: .
@@ -67,8 +52,6 @@ services:
     depends_on:
       neo4j:
         condition: service_healthy
-      sample-odata:
-        condition: service_started
     ports:
       - "8000:8000"
     volumes:
@@ -80,34 +63,6 @@ services:
       timeout: 10s
       start_period: 120s
       retries: 5
-
-  seeder:
-    build:
-      context: .
-      dockerfile: backend/Dockerfile
-    container_name: odata-seeder
-    depends_on:
-      backend:
-        condition: service_healthy
-      sample-odata:
-        condition: service_started
-      neo4j:
-        condition: service_healthy
-    environment:
-      NEO4J_URI: bolt://neo4j:7687
-      NEO4J_USER: neo4j
-      NEO4J_PASSWORD: password
-      CHROMA_PERSIST_DIR: /app/data/chroma_db
-      SQLITE_DB_PATH: /app/data/app.db
-      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
-      SEED_LOCAL_SAMPLE: "1"
-      SAMPLE_ODATA_URL: http://sample-odata:5000
-      NORTHWIND_URL: https://services.odata.org/V4/Northwind/Northwind.svc
-    volumes:
-      - backend_data:/app/data
-      - chroma_cache:/root/.cache/chroma
-    entrypoint: ["python", "-m", "scripts.seed_sample_service"]
-    restart: "no"
 
   frontend:
     build:
@@ -142,6 +97,15 @@ services:
       - N8N_DIAGNOSTICS_ENABLED=false
       - N8N_PERSONALIZATION_ENABLED=false
       - GENERIC_TIMEZONE=UTC
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - SMTP_FROM=${SMTP_FROM:-chatbot@yourcompany.com}
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID:-}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN:-}
+      - TWILIO_WHATSAPP_NUMBER=${TWILIO_WHATSAPP_NUMBER:-whatsapp:+14155238886}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
     ports:
       - "5678:5678"
     volumes:
