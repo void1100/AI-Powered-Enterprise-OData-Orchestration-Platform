@@ -48,11 +48,24 @@ from app.mcp.mcp_server import mcp_server
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _recovery_complete
     logger.info("Starting OData Orchestration backend...")
     policy_engine.ensure_default_roles()
-    await service_manager.recover_from_graph()
+    async def _run_recovery():
+        global _recovery_complete
+        try:
+            await service_manager.recover_from_graph()
+        except Exception as e:
+            logger.warning(f"Background recovery failed: {e}")
+        finally:
+            _recovery_complete = True
+            logger.info("Service recovery complete — server fully ready.")
+    asyncio.create_task(_run_recovery())
     yield
     logger.info("Shutting down.")
+
+
+_recovery_complete = False
 
 
 app = FastAPI(title="Advanced OData Service Orchestration", version="1.0.0", lifespan=lifespan)
@@ -92,6 +105,13 @@ async def health():
     from app.services.query_optimizer import query_optimizer
     from app.services.query_rag import query_plan_rag
     return {"status": "ok", "optimizer": query_optimizer.stats, "rag": query_plan_rag.get_stats()}
+
+
+@app.get("/ready")
+async def ready():
+    if not _recovery_complete:
+        raise HTTPException(status_code=503, detail="Services still loading")
+    return {"status": "ready"}
 
 
 @app.get("/services", response_model=List[ServiceInfo])
@@ -139,9 +159,7 @@ async def delete_service(service_id: str, request: Request):
         raise HTTPException(status_code=403, detail="Admin access required")
     if service_id not in service_manager._services:
         raise HTTPException(status_code=404, detail="Service not found")
-    del service_manager._services[service_id]
-    service_manager._clients.pop(service_id, None)
-    service_manager._entity_to_set.pop(service_id, None)
+    service_manager.delete_service(service_id)
     return {"deleted": service_id}
 
 
@@ -217,6 +235,34 @@ async def services_health():
     return {"services": results}
 
 
+def _build_column_labels(service_id: str, entity_set: str, columns: list) -> dict:
+    """Build column_labels dict from entity metadata using direct O(1) lookup."""
+    svc_raw = service_manager.get_service(service_id)
+    if not svc_raw:
+        return {}
+    entity_labels = {}
+    meta = svc_raw.get("metadata", {})
+    for es in meta.get("entity_sets", []):
+        es_name = es["name"]
+        et_name = es.get("entity_type", es_name)
+        et = next((e for e in meta.get("entity_types", []) if e["name"] == et_name), None)
+        if not et and "." in et_name:
+            local_name = et_name.rsplit(".", 1)[-1]
+            et = next((e for e in meta.get("entity_types", []) if e["name"] == local_name), None)
+        if not et:
+            et = next((e for e in meta.get("entity_types", []) if et_name.endswith(e["name"])), None)
+        prop_labels = {p["name"]: p.get("label", "") for p in (et or {}).get("properties", [])}
+        entity_labels[es_name] = prop_labels
+    labels_info = entity_labels.get(entity_set, {})
+    if not labels_info and entity_set:
+        es_lower = entity_set.lower()
+        for key, val in entity_labels.items():
+            if key.lower() == es_lower or key.lower().endswith(es_lower) or es_lower.endswith(key.lower()):
+                labels_info = val
+                break
+    return {col: labels_info[col] for col in columns if col in labels_info and labels_info[col]}
+
+
 # --- Entity Selector Endpoints ---
 
 from app.services.entity_selector import entity_selector, classify_property
@@ -230,18 +276,34 @@ async def get_service_entities(service_id: str):
     if not svc:
         raise HTTPException(status_code=404, detail=f"Service '{service_id}' not found")
     entities = []
+    entity_labels = svc.get("entity_labels", {})
     for es_name in svc.get("entity_sets", []):
         props = svc.get("entity_properties", {}).get(es_name, [])
+        labels_info = entity_labels.get(es_name, {})
+        entity_label = labels_info.get("entity_label", "")
+        prop_labels = labels_info.get("property_labels", {})
         labeled_props = []
         for p in props:
             if isinstance(p, str):
-                labeled_props.append({"name": p, "label": classify_property(p)})
+                sap_label = prop_labels.get(p, "")
+                labeled_props.append({
+                    "name": p,
+                    "label": classify_property(p),
+                    "display_label": sap_label or p,
+                })
             elif isinstance(p, dict):
-                labeled_props.append({**p, "label": classify_property(p.get("name", ""))})
+                sap_label = p.get("label", "") or prop_labels.get(p.get("name", ""), "")
+                name = p.get("name", "")
+                labeled_props.append({
+                    **p,
+                    "label": classify_property(name),
+                    "display_label": sap_label or name,
+                })
             else:
                 labeled_props.append({"name": str(p), "label": "Attribute"})
         entities.append({
             "name": es_name,
+            "label": entity_label,
             "properties": labeled_props,
             "property_count": len(labeled_props),
         })
@@ -355,16 +417,23 @@ async def execute_entity_join(payload: EntityJoinExecuteRequest):
                 merged["_source_service"] = r["service_id"]
                 rows.append(merged)
 
+    entity_service_lookup = {
+        e.entity_name: e.service_id
+        for e in payload.entities
+    }
+
     # Store successful joins for future reference
     for j in joins:
         le = j.left_entity if hasattr(j, "left_entity") else j.get("left_entity", "") if isinstance(j, dict) else ""
         re_ = j.right_entity if hasattr(j, "right_entity") else j.get("right_entity", "") if isinstance(j, dict) else ""
         lk = j.left_key if hasattr(j, "left_key") else j.get("left_key", "") if isinstance(j, dict) else ""
         rk = j.right_key if hasattr(j, "right_key") else j.get("right_key", "") if isinstance(j, dict) else ""
+        left_service = j.left_service if hasattr(j, "left_service") else j.get("left_service", "") if isinstance(j, dict) else ""
+        right_service = j.right_service if hasattr(j, "right_service") else j.get("right_service", "") if isinstance(j, dict) else ""
         entity_selector.store_successful_join(
-            e.service_id if payload.entities else "",
+            left_service or entity_service_lookup.get(le, ""),
             le,
-            e.service_id if payload.entities else "",
+            right_service or entity_service_lookup.get(re_, ""),
             re_,
             lk,
             rk,
@@ -1252,7 +1321,10 @@ async def chat(payload: ChatRequest, request: Request):
                     entity_names = [e.get("entity_name") for e in selected]
                     summary = f"Joined {len(entity_names)} entities ({', '.join(entity_names)}): {len(rows)} rows, {len(columns)} columns"
                     tool_calls_me = [{"type": "entity_join", "entities": entity_names, "joins": len(detected_joins), "row_count": len(rows)}]
-                    add_message(session_id, "assistant", summary, plan=None, result={"table": {"columns": columns, "rows": rows, "row_count": len(rows)}, "tool_calls": tool_calls_me})
+                    all_col_labels = {}
+                    for ent in selected:
+                        all_col_labels.update(_build_column_labels(ent.get("service_id", ""), ent.get("entity_name", ""), columns))
+                    add_message(session_id, "assistant", summary, plan=None, result={"table": {"columns": columns, "rows": rows, "row_count": len(rows), "column_labels": all_col_labels or None}, "tool_calls": tool_calls_me})
                     _log_chat_usage("entity_join", 0, 0, intent="entity_join")
                     atr = _do_auto_train(rows, columns)
                     return ChatResponse(
@@ -1265,7 +1337,7 @@ async def chat(payload: ChatRequest, request: Request):
                         discovery=None,
                         tool_calls=tool_calls_me,
                         blocked_steps=[],
-                        table=TableData(columns=columns, rows=rows, row_count=len(rows)),
+                        table=TableData(columns=columns, rows=rows, row_count=len(rows), column_labels=all_col_labels or None),
                         primary_url=None,
                         primary_service=selected[0].get("service_id", ""),
                         error=None,
@@ -1292,7 +1364,10 @@ async def chat(payload: ChatRequest, request: Request):
                         combined_cols, combined_rows = filtered["columns"], filtered["rows"]
                         summary = f"No matching rows found between {', '.join(entity_names)} — showing individual entity data ({len(combined_rows)} rows)"
                         tool_calls_me = [{"type": "entity_select", "entities": entity_names, "row_count": len(combined_rows)}]
-                        add_message(session_id, "assistant", summary, plan=None, result={"table": {"columns": combined_cols, "rows": combined_rows, "row_count": len(combined_rows)}, "tool_calls": tool_calls_me})
+                        all_col_labels = {}
+                        for ent in selected:
+                            all_col_labels.update(_build_column_labels(ent.get("service_id", ""), ent.get("entity_name", ""), combined_cols))
+                        add_message(session_id, "assistant", summary, plan=None, result={"table": {"columns": combined_cols, "rows": combined_rows, "row_count": len(combined_rows), "column_labels": all_col_labels or None}, "tool_calls": tool_calls_me})
                         _log_chat_usage("entity_select", 0, 0, intent="entity_select")
                         return ChatResponse(
                             run_id=str(uuid.uuid4()),
@@ -1304,7 +1379,7 @@ async def chat(payload: ChatRequest, request: Request):
                             discovery=None,
                             tool_calls=tool_calls_me,
                             blocked_steps=[],
-                            table=TableData(columns=combined_cols, rows=combined_rows, row_count=len(combined_rows)),
+                            table=TableData(columns=combined_cols, rows=combined_rows, row_count=len(combined_rows), column_labels=all_col_labels or None),
                             primary_url=None,
                             primary_service=selected[0].get("service_id", ""),
                             error=None,
@@ -1331,7 +1406,10 @@ async def chat(payload: ChatRequest, request: Request):
                     combined_cols, combined_rows = filtered["columns"], filtered["rows"]
                     summary = f"Selected {len(entity_names)} entities: {', '.join(entity_names)} — {len(combined_rows)} rows total"
                     tool_calls_me = [{"type": "entity_select", "entities": entity_names, "row_count": len(combined_rows)}]
-                    add_message(session_id, "assistant", summary, plan=None, result={"table": {"columns": combined_cols, "rows": combined_rows, "row_count": len(combined_rows)}, "tool_calls": tool_calls_me})
+                    all_col_labels = {}
+                    for ent in selected:
+                        all_col_labels.update(_build_column_labels(ent.get("service_id", ""), ent.get("entity_name", ""), combined_cols))
+                    add_message(session_id, "assistant", summary, plan=None, result={"table": {"columns": combined_cols, "rows": combined_rows, "row_count": len(combined_rows), "column_labels": all_col_labels or None}, "tool_calls": tool_calls_me})
                     _log_chat_usage("entity_select", 0, 0, intent="entity_select")
                     return ChatResponse(
                         run_id=str(uuid.uuid4()),
@@ -1343,7 +1421,7 @@ async def chat(payload: ChatRequest, request: Request):
                         discovery=None,
                         tool_calls=tool_calls_me,
                         blocked_steps=[],
-                        table=TableData(columns=combined_cols, rows=combined_rows, row_count=len(combined_rows)),
+                        table=TableData(columns=combined_cols, rows=combined_rows, row_count=len(combined_rows), column_labels=all_col_labels or None),
                         primary_url=None,
                         primary_service=selected[0].get("service_id", ""),
                         error=None,
@@ -1372,7 +1450,8 @@ async def chat(payload: ChatRequest, request: Request):
                         _log_chat_usage("entity_select", 0, 0, intent="entity_select")
                         atr = _do_auto_train(rows, cols)
                         tool_calls_me = [{"type": "entity_select", "service_id": sid, "entity": ename, "row_count": len(rows)}]
-                        add_message(session_id, "assistant", summary, plan=None, result={"table": {"columns": cols, "rows": rows, "row_count": len(rows)}, "tool_calls": tool_calls_me})
+                        col_labels = _build_column_labels(sid, ename, cols)
+                        add_message(session_id, "assistant", summary, plan=None, result={"table": {"columns": cols, "rows": rows, "row_count": len(rows), "column_labels": col_labels or None}, "tool_calls": tool_calls_me})
                         return ChatResponse(
                             run_id=str(uuid.uuid4()),
                             session_id=session_id,
@@ -1383,7 +1462,7 @@ async def chat(payload: ChatRequest, request: Request):
                             discovery=None,
                             tool_calls=tool_calls_me,
                             blocked_steps=[],
-                            table=TableData(columns=cols, rows=rows, row_count=len(rows)),
+                            table=TableData(columns=cols, rows=rows, row_count=len(rows), column_labels=col_labels or None),
                             primary_url=None,
                             primary_service=sid,
                             error=None,
@@ -1638,6 +1717,7 @@ async def chat(payload: ChatRequest, request: Request):
         drill_down_links=drill_links,
         intent=result.get("intent"),
         auto_train_result=auto_train_result,
+        write_preview=result.get("write_preview"),
     )
 
 
@@ -1728,6 +1808,221 @@ async def clear_cache():
     query_cache.clear()
     query_optimizer.clear_cache()
     return {"ok": True}
+
+
+@app.get("/entities/{service_id}/{entity_set}/fields")
+async def get_entity_fields(service_id: str, entity_set: str):
+    """Get field requirements for an entity (required, optional, auto-generated)."""
+    from app.services.guardrails import get_entity_field_requirements
+    return get_entity_field_requirements(service_id, entity_set)
+
+
+@app.get("/write/history")
+async def get_write_history_endpoint(limit: int = 50, operation: str = "", entity_set: str = ""):
+    """Get write operation history for audit trail."""
+    from app.services.guardrails import get_write_history, get_write_history_stats
+    return {
+        "stats": get_write_history_stats(),
+        "history": get_write_history(limit=limit, operation=operation, entity_set=entity_set),
+    }
+
+
+@app.post("/chat/write/preview")
+async def write_preview(payload: ChatRequest, request: Request):
+    """Preview a write operation and return confirmation summary before executing."""
+    from app.services.guardrails import build_write_summary, run_input_guards, get_entity_field_requirements
+    from app.agents.reasoning_engine import llm_engine
+
+    user = get_current_user(request)
+    user_role = user.get("role", "user") if user else payload.user_role
+
+    # Use LLM to extract write operation details from natural language
+    services = service_manager.list_services()
+    plan, llm_meta = await llm_engine.plan(payload.query, services, memory_context=[])
+
+    write_intents = {"create", "update", "delete"}
+    if plan.get("intent") not in write_intents or not plan.get("write_operation"):
+        return {"error": "Could not detect a write operation in your query. Try phrases like 'create a new order' or 'update customer X'."}
+
+    write_op = plan["write_operation"]
+    entity_set = write_op.get("entity_set", "")
+    operation = write_op.get("operation", plan.get("intent"))
+    fields = write_op.get("fields", {})
+    entity_id = write_op.get("entity_id")
+    service_id = write_op.get("service_id") or (plan.get("target_services", [None])[0] if plan.get("target_services") else None)
+    required_fields = write_op.get("required_fields", [])
+
+    # Get entity-specific field requirements from metadata
+    field_reqs = get_entity_field_requirements(service_id, entity_set)
+    entity_required = field_reqs.get("required_fields", [])
+    entity_optional = field_reqs.get("optional_fields", [])
+    auto_generated = field_reqs.get("auto_generated_fields", [])
+
+    # Merge: entity metadata required fields + LLM-detected required fields
+    all_required = list(set(entity_required + required_fields))
+
+    # Run input guards
+    guard_result = run_input_guards(
+        user_role=user_role,
+        user_id=payload.session_id or "anonymous",
+        entity_set=entity_set,
+        operation=operation,
+        fields=fields,
+        required_fields=all_required,
+        confirmed=False,
+    )
+
+    # Check for missing required fields
+    missing = [f for f in all_required if f not in fields or not fields.get(f)]
+
+    # If blocked due to missing fields, return write_preview so frontend shows the modal
+    if not guard_result.allow and missing:
+        summary = build_write_summary(
+            operation=operation,
+            entity_set=entity_set,
+            fields=fields,
+            service_id=service_id,
+            missing_fields=missing,
+        )
+        return {
+            "preview": True,
+            "operation": operation,
+            "entity_set": entity_set,
+            "service_id": service_id,
+            "fields": fields,
+            "entity_id": entity_id,
+            "required_fields": all_required,
+            "optional_fields": entity_optional[:10],
+            "auto_generated_fields": auto_generated,
+            "missing_fields": missing,
+            "confirmation_summary": summary,
+            "needs_user_input": True,
+        }
+
+    if not guard_result.allow:
+        return {"error": f"Blocked: {guard_result.reason}", "blocked": True}
+
+    # Build confirmation summary
+    summary = build_write_summary(
+        operation=operation,
+        entity_set=entity_set,
+        fields=fields,
+        service_id=service_id,
+        missing_fields=missing,
+    )
+
+    return {
+        "preview": True,
+        "operation": operation,
+        "entity_set": entity_set,
+        "service_id": service_id,
+        "fields": fields,
+        "entity_id": entity_id,
+        "required_fields": all_required,
+        "optional_fields": entity_optional[:10],
+        "auto_generated_fields": auto_generated,
+        "missing_fields": missing,
+        "confirmation_summary": summary,
+        "needs_user_input": len(missing) > 0,
+    }
+
+
+@app.post("/chat/write/execute")
+async def write_execute(payload: ChatRequest, request: Request):
+    """Execute a confirmed write operation."""
+    from app.services.guardrails import run_input_guards, run_output_guards
+    from app.services.odata_client import ODataClient
+
+    user = get_current_user(request)
+    user_role = user.get("role", "user") if user else payload.user_role
+
+    # Parse write operation from query context (expects JSON in query field)
+    import json
+    try:
+        write_op = json.loads(payload.query) if payload.query.startswith("{") else {}
+    except json.JSONDecodeError:
+        return {"error": "Invalid write operation format"}
+
+    if not write_op:
+        return {"error": "No write operation provided"}
+
+    operation = write_op.get("operation", "")
+    entity_set = write_op.get("entity_set", "")
+    fields = write_op.get("fields", {})
+    entity_id = write_op.get("entity_id")
+    service_id = write_op.get("service_id", "")
+
+    if not service_id or not entity_set:
+        return {"error": "service_id and entity_set required"}
+
+    # Run input guards with confirmed=True
+    guard_result = run_input_guards(
+        user_role=user_role,
+        user_id=payload.session_id or "anonymous",
+        entity_set=entity_set,
+        operation=operation,
+        fields=fields,
+        required_fields=[],
+        confirmed=True,
+    )
+
+    if not guard_result.allow:
+        from app.services.guardrails import log_write_operation
+        log_write_operation(
+            operation=operation, entity_set=entity_set, service_id=service_id,
+            user_role=user_role, user_id=payload.session_id or "anonymous",
+            fields=fields, success=False, error=guard_result.reason,
+        )
+        return {"error": f"Blocked: {guard_result.reason}"}
+
+    # Execute write
+    try:
+        svc = service_manager._services.get(service_id, {})
+        if not svc:
+            return {"error": f"Service '{service_id}' not found"}
+
+        client = ODataClient(svc.get("base_url", ""), auth_type=svc.get("auth_type"), auth_config=svc.get("auth_config"))
+
+        if operation == "create":
+            result = await client.create(entity_set, fields)
+        elif operation == "update":
+            if not entity_id:
+                return {"error": "entity_id required for update"}
+            result = await client.update(entity_set, entity_id, fields)
+        elif operation == "delete":
+            if not entity_id:
+                return {"error": "entity_id required for delete"}
+            result = await client.delete(entity_set, entity_id)
+        else:
+            return {"error": f"Unknown operation: {operation}"}
+
+        # Run output guards
+        result = run_output_guards(result, operation)
+
+        # Log successful write
+        from app.services.guardrails import log_write_operation
+        log_write_operation(
+            operation=operation, entity_set=entity_set, service_id=service_id,
+            user_role=user_role, user_id=payload.session_id or "anonymous",
+            fields=fields, success=True, entity_id=entity_id or "",
+        )
+
+        return {
+            "success": True,
+            "operation": operation,
+            "entity_set": entity_set,
+            "result": result,
+            "summary": f"Successfully {operation}d entity in {entity_set}",
+        }
+    except Exception as e:
+        logger.exception(f"Write execution failed: {e}")
+        from app.services.guardrails import log_write_operation
+        log_write_operation(
+            operation=operation, entity_set=entity_set, service_id=service_id,
+            user_role=user_role, user_id=payload.session_id or "anonymous",
+            fields=fields, success=False, error=str(e),
+        )
+        return {"error": f"Write failed: {str(e)}"}
 
 
 @app.get("/sessions", response_model=List[SessionInfo])

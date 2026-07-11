@@ -25,6 +25,9 @@ class QueryIntent:
     COMPARE = "compare"
     FILTER = "filter"
     COUNT = "count"
+    CREATE = "create"
+    UPDATE = "update"
+    DELETE_INTENT = "delete"
     UNKNOWN = "unknown"
 
 
@@ -64,6 +67,9 @@ class QueryOptimizer:
         "compare", "vs", "versus", "difference", "对比", "differ",
     }
     COUNT_KEYWORDS = {"count", "how many", "number of", "total number"}
+    CREATE_KEYWORDS = {"create", "add", "new", "insert", "make", "register", "submit"}
+    UPDATE_KEYWORDS = {"update", "modify", "change", "set", "edit", "replace", "patch"}
+    DELETE_KEYWORDS = {"delete", "remove", "destroy", "drop", "eliminate"}
 
     # Signals that a query is too complex for the mock planner (needs LLM)
     COMPLEXITY_SIGNALS = [
@@ -99,6 +105,14 @@ class QueryOptimizer:
     def classify_intent(self, query: str) -> str:
         """Classify query intent without LLM (saves tokens)."""
         q = query.lower().strip()
+
+        # Write intents (must be before read checks)
+        if any(kw in q for kw in self.DELETE_KEYWORDS):
+            return QueryIntent.DELETE_INTENT
+        if any(kw in q for kw in self.UPDATE_KEYWORDS):
+            return QueryIntent.UPDATE
+        if any(kw in q for kw in self.CREATE_KEYWORDS):
+            return QueryIntent.CREATE
 
         # Prediction (must be before other checks)
         if any(kw in q for kw in self.PREDICT_KEYWORDS):
@@ -233,7 +247,17 @@ class QueryOptimizer:
             return None
 
         q = query.lower()
-        q_words = set(re.findall(r'[a-z]+', q)) - self.STOP_COLUMN_WORDS
+        def normalize_word(word: str) -> str:
+            if word.endswith("ies") and len(word) > 4:
+                return word[:-3] + "y"
+            if word.endswith("es") and len(word) > 3:
+                return word[:-2]
+            if word.endswith("s") and len(word) > 3:
+                return word[:-1]
+            return word
+
+        q_words = {normalize_word(w) for w in re.findall(r'[a-z]+', q)}
+        q_words = q_words - self.STOP_COLUMN_WORDS
 
         if not q_words:
             return None
@@ -242,7 +266,7 @@ class QueryOptimizer:
         matched_cols = []
         for prop in entity_properties:
             prop_lower = prop.lower()
-            prop_words = set(re.findall(r'[a-z]+', prop_lower))
+            prop_words = {normalize_word(w) for w in re.findall(r'[a-z]+', prop_lower)}
 
             # Direct match: query word appears in column name
             if q_words & prop_words:

@@ -22,13 +22,14 @@ class ServiceInfo(BaseModel):
     description: str = ""
     entity_sets: List[str] = []
     entity_properties: Dict[str, List[str]] = {}
+    entity_labels: Dict[str, Dict[str, Any]] = {}
 
 
 class ChatRequest(BaseModel):
     query: str
     session_id: Optional[str] = None
     user_role: str = "Admin"
-    selected_entities: Optional[List[Dict[str, str]]] = None
+    selected_entities: Optional[List[Dict[str, Any]]] = None
     # [{"service_id": "sopra-po", "entity_name": "A_PurchaseOrder"}]
 
 
@@ -38,6 +39,13 @@ class TableData(BaseModel):
     row_count: int = 0
     truncated: bool = False
     total_count: Optional[int] = None
+    all_columns: Optional[List[str]] = None
+    all_rows: Optional[List[Dict[str, Any]]] = None
+    column_labels: Optional[Dict[str, str]] = None
+    hidden_columns: Optional[List[Dict[str, str]]] = None
+    smart_columns: Optional[List[str]] = None
+    smart_rows: Optional[List[Dict[str, Any]]] = None
+    filter_note: Optional[str] = None
 
 
 class DiscoveryCandidate(BaseModel):
@@ -92,6 +100,7 @@ class ChatResponse(BaseModel):
     cached: bool = False
     intent: Optional[str] = None
     auto_train_result: Optional[Dict[str, Any]] = None
+    write_preview: Optional[Dict[str, Any]] = None
 
 
 class SessionCreate(BaseModel):

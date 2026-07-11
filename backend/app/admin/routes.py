@@ -436,9 +436,7 @@ async def delete_service_admin(service_id: str, request: Request, user=Depends(r
     from app.services.service_manager import service_manager
     if service_id not in service_manager._services:
         raise HTTPException(status_code=404, detail="Service not found")
-    del service_manager._services[service_id]
-    service_manager._clients.pop(service_id, None)
-    service_manager._entity_to_set.pop(service_id, None)
+    service_manager.delete_service(service_id)
 
     db = get_auth_db()
     db.log_audit(user_id=user.get("user_id"), username=user.get("sub"), action="delete", resource="services", resource_id=service_id, ip_address=request.client.host, status="success")

@@ -120,6 +120,7 @@ class LLMReasoningEngine:
         For large services, send only suggested entity names + limited properties."""
         entity_props = svc.get("entity_properties", {})
         entity_sets = svc.get("entity_sets", [])
+        entity_labels = svc.get("entity_labels", {})
 
         if len(entity_sets) <= max_entities:
             return {
@@ -127,18 +128,23 @@ class LLMReasoningEngine:
                 "name": svc["name"],
                 "entity_sets": entity_sets,
                 "entity_properties": entity_props,
+                "entity_labels": entity_labels,
             }
 
         truncated_props = {}
+        truncated_labels = {}
         for es_name in entity_sets[:max_entities]:
             props = entity_props.get(es_name, [])
             truncated_props[es_name] = props[:max_props_per_entity]
+            if es_name in entity_labels:
+                truncated_labels[es_name] = entity_labels[es_name]
 
         return {
             "id": svc["id"],
             "name": svc["name"],
             "entity_sets": entity_sets,
             "entity_properties": truncated_props,
+            "entity_labels": truncated_labels,
         }
 
     async def plan(
@@ -269,8 +275,16 @@ class LLMReasoningEngine:
         intent = self._infer_intent(q)
         chosen_service = self._pick_service(services, q)
         entity_set, candidate_properties = self._pick_entity_set(services, chosen_service, q)
+
+        # Extract metadata XML for column priority parsing
+        metadata_xml = ""
+        svc_data = next((s for s in services if s["id"] == chosen_service), None)
+        if svc_data:
+            metadata_xml = svc_data.get("metadata_xml", "")
+
         select, expand, filter_expr, orderby, top = self._build_query_parts(
-            q, entity_set, candidate_properties
+            q, entity_set, candidate_properties,
+            service_id=chosen_service or "", metadata_xml=metadata_xml,
         )
         steps = []
         if chosen_service and entity_set:
@@ -285,7 +299,7 @@ class LLMReasoningEngine:
                 "orderby": orderby,
             })
         summary = self._summarize(query, steps)
-        return {
+        result = {
             "intent": intent,
             "target_services": [chosen_service] if chosen_service else [],
             "steps": steps,
@@ -293,7 +307,25 @@ class LLMReasoningEngine:
             "memory_used": memory_context or [],
         }
 
+        # For write intents, add write_operation
+        if intent in ("create", "update", "delete"):
+            result["write_operation"] = {
+                "operation": intent,
+                "entity_set": entity_set or "",
+                "service_id": chosen_service or "",
+                "fields": {},
+                "entity_id": None,
+                "confirmed": False,
+            }
+        return result
+
     def _infer_intent(self, q: str) -> str:
+        if any(w in q for w in ["create", "add", "new", "insert", "submit"]):
+            return "create"
+        if any(w in q for w in ["update", "modify", "change", "set", "edit", "replace"]):
+            return "update"
+        if any(w in q for w in ["delete", "remove", "destroy", "drop"]):
+            return "delete"
         if any(w in q for w in ["how many", "count", "total", "which", "least", "fewest", "most", "highest", "lowest"]):
             return "aggregate"
         if any(w in q for w in ["with", "including", "and their", "along with"]):
@@ -307,18 +339,19 @@ class LLMReasoningEngine:
     def _pick_service(self, services: List[Dict[str, Any]], q: str) -> Optional[str]:
         if not services:
             return None
+        q_lower = q.lower()
         # Generic tokens that appear in many service names/descriptions — skip for matching
         generic_tokens = {"odata", "service", "api", "data", "v4", "v2", "v3", "rest", "the", "and", "for", "srv", "local", "order", "manage", "test", "http", "https", "com", "ondemand", "eu10", "cfapps", "it", "cpi001", "rt", "soprasteriagroup"}
         # First pass: match by service name tokens (explicit mention)
         for svc in services:
             name_tokens = re.findall(r"[a-zA-Z]+", svc.get("name", "").lower())
-            if any(t and len(t) > 2 and t not in generic_tokens and t in q for t in name_tokens):
+            if any(t and len(t) > 2 and t not in generic_tokens and t in q_lower for t in name_tokens):
                 return svc["id"]
         # Second pass: match by entity set name
         for svc in services:
             for es in svc.get("entity_sets", []):
                 es_lower = es.lower().replace("_", " ")
-                if es_lower in q or es.lower() in q:
+                if es_lower in q_lower or es.lower() in q_lower:
                     return svc["id"]
         return services[0]["id"]
 
@@ -473,7 +506,8 @@ class LLMReasoningEngine:
             return best_entity
         return None
 
-    def _build_query_parts(self, q: str, entity_set: Optional[str], candidate_properties: List[str]):
+    def _build_query_parts(self, q: str, entity_set: Optional[str], candidate_properties: List[str],
+                           service_id: str = "", metadata_xml: str = ""):
         select: List[str] = []
         expand: List[str] = []
         filter_expr: Optional[str] = None
@@ -489,9 +523,31 @@ class LLMReasoningEngine:
         if top is None and any(w in q.split() for w in ["all", "every"]):
             top = 100
 
-        # Smart $select: pick only useful columns from candidate_properties
+        # Two-pass column selection using priority map
         if candidate_properties:
-            select = self._pick_smart_columns(q, candidate_properties)
+            try:
+                from app.services.column_priority import get_top_columns, log_field_selection
+                top_columns = get_top_columns(
+                    entity_set_name=entity_set or "",
+                    service_id=service_id,
+                    all_fields=candidate_properties,
+                    metadata_xml=metadata_xml,
+                    max_columns=20,
+                )
+                if top_columns:
+                    select = top_columns
+                    log_field_selection(
+                        entity_set=entity_set or "",
+                        service_id=service_id,
+                        query=q,
+                        selected_fields=select,
+                        total_fields=len(candidate_properties),
+                    )
+                else:
+                    select = self._pick_smart_columns(q, candidate_properties)
+            except Exception as e:
+                logger.warning(f"Column priority failed, falling back to smart columns: {e}")
+                select = self._pick_smart_columns(q, candidate_properties)
 
         explicit_filters: List[str] = []
         m = re.search(r"\bwhere\s+([\w'\".= ]+?)(?:\s+(?:and|order|by|with|including|limit|top)\b|$)", q)
@@ -590,12 +646,12 @@ class LLMReasoningEngine:
         "InternalNumber", "CharcInternal", "ConfigurableProd",
         "CrossPlantConfigurable", "ProdCharc", "Signature",
         "PDFStandard", "CoverPage", "FormatSet", "TableColumn",
-        "MyDocument", "ValueHelp", "SeasonYear",
+        "MyDocument", "ValueHelp",
     ]
 
     def _pick_smart_columns(self, q: str, candidate_properties: List[str]) -> List[str]:
-        """Pick 5-8 most relevant columns from candidate_properties."""
-        if not candidate_properties or len(candidate_properties) <= 6:
+        """Pick relevant columns from candidate_properties, keeping most of them."""
+        if not candidate_properties or len(candidate_properties) <= 20:
             return candidate_properties
 
         scored = []
@@ -617,9 +673,9 @@ class LLMReasoningEngine:
             scored.append((col, score))
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        keep = [col for col, sc in scored if sc > -5][:8]
-        if len(keep) < 5:
-            keep = [col for col, _ in scored][:6]
+        keep = [col for col, sc in scored if sc > -5]
+        if len(keep) < 10:
+            keep = [col for col, _ in scored][:15]
         return keep
 
     def _summarize(self, query: str, steps: List[Dict[str, Any]]) -> str:
@@ -662,8 +718,13 @@ class LLMReasoningEngine:
             "Example: 'top 5 customers by order count' → step1: Customers (top=200), step2: Orders (top=200). "
             "OData does NOT support JOINs/GROUP BY — backend does aggregation in Python. "
             "For prediction queries: set intent='predict', add prediction object (entity_key, features, target). No steps. "
-            "IMPORTANT for $select: Only include columns the user actually needs. Skip empty/internal fields like *InternalNumber*, *Charc*Internal*. "
-            "Pick 5-8 most relevant columns based on the query. E.g., for 'show materials' select Material, MaterialType, Material_Text, MaterialGrossWeight."
+            "For write queries (create/update/delete): set intent='create'/'update'/'delete', add write_operation object with "
+            "operation, service_id, entity_set, fields (key=value pairs), entity_id (for update/delete), required_fields (list), confirmed (bool). "
+            "For create: include all required fields. For update/delete: include entity_id. "
+            "IMPORTANT for $select: Include ALL meaningful columns from the entity. Only skip columns ending in InternalNumber, CharcInternal, or starting with __. "
+            "Do NOT limit to 5-8 columns — the user needs to see all available business data. The post-filter will hide truly useless columns. "
+            "Use friendly labels from entity_labels in summaries (e.g., 'Purchase Order' instead of 'A_PurchaseOrder'). "
+            "If entity_labels provided, use the label as display name and technical name for API calls."
         )
 
         suggested_services = set(s["service_id"] for s in suggestions if s.get("service_id"))
@@ -755,8 +816,8 @@ class LLMReasoningEngine:
             "Example: 'top 5 customers by order count' → step1: Customers (top=200), step2: Orders (top=200). "
             "OData does NOT support JOINs/GROUP BY — backend does aggregation in Python. "
             "For prediction queries: set intent='predict', add prediction object (entity_key, features, target). No steps. "
-            "IMPORTANT for $select: Only include columns the user actually needs. Skip empty/internal fields like *InternalNumber*, *Charc*Internal*. "
-            "Pick 5-8 most relevant columns based on the query. E.g., for 'show materials' select Material, MaterialType, Material_Text, MaterialGrossWeight."
+            "IMPORTANT for $select: Include ALL meaningful columns from the entity. Only skip columns ending in InternalNumber, CharcInternal, or starting with __. "
+            "Do NOT limit to 5-8 columns — the user needs to see all available business data. The post-filter will hide truly useless columns."
         )
 
         suggested_services = set(s["service_id"] for s in suggestions if s.get("service_id"))
@@ -870,8 +931,8 @@ class LLMReasoningEngine:
             "Example: 'top 5 customers by order count' → step1: Customers (top=200), step2: Orders (top=200). "
             "OData does NOT support JOINs/GROUP BY — backend does aggregation in Python. "
             "For prediction queries: set intent='predict', add prediction object (entity_key, features, target). No steps. "
-            "IMPORTANT for $select: Only include columns the user actually needs. Skip empty/internal fields like *InternalNumber*, *Charc*Internal*. "
-            "Pick 5-8 most relevant columns based on the query. E.g., for 'show materials' select Material, MaterialType, Material_Text, MaterialGrossWeight."
+            "IMPORTANT for $select: Include ALL meaningful columns from the entity. Only skip columns ending in InternalNumber, CharcInternal, or starting with __. "
+            "Do NOT limit to 5-8 columns — the user needs to see all available business data. The post-filter will hide truly useless columns."
         )
 
         suggested_services = set(s["service_id"] for s in suggestions if s.get("service_id"))
@@ -991,8 +1052,8 @@ class LLMReasoningEngine:
             "Example: 'top 5 customers by order count' → step1: Customers (top=200), step2: Orders (top=200). "
             "OData does NOT support JOINs/GROUP BY — backend does aggregation in Python. "
             "For prediction queries: set intent='predict', add prediction object (entity_key, features, target). No steps. "
-            "IMPORTANT for $select: Only include columns the user actually needs. Skip empty/internal fields like *InternalNumber*, *Charc*Internal*. "
-            "Pick 5-8 most relevant columns based on the query. E.g., for 'show materials' select Material, MaterialType, Material_Text, MaterialGrossWeight."
+            "IMPORTANT for $select: Include ALL meaningful columns from the entity. Only skip columns ending in InternalNumber, CharcInternal, or starting with __. "
+            "Do NOT limit to 5-8 columns — the user needs to see all available business data. The post-filter will hide truly useless columns."
         )
 
         suggested_services = set(s["service_id"] for s in suggestions if s.get("service_id"))

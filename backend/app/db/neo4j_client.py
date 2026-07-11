@@ -94,6 +94,8 @@ class Neo4jClient:
                     e.description = $description,
                     e.allowed_ops = $allowed_ops,
                     e.properties = $properties,
+                    e.label = $label,
+                    e.property_labels = $property_labels,
                     e.is_custom = $is_custom,
                     e.base_entity_set = $base_entity_set,
                     e.default_filter = $default_filter,
@@ -108,6 +110,8 @@ class Neo4jClient:
                 description=entity.get("description", ""),
                 allowed_ops=entity.get("allowed_ops", []),
                 properties=entity.get("properties", []),
+                label=entity.get("label", ""),
+                property_labels=__import__("json").dumps(entity.get("property_labels", {})),
                 is_custom=entity.get("is_custom", False),
                 base_entity_set=entity.get("base_entity_set", ""),
                 default_filter=entity.get("default_filter", ""),
@@ -176,7 +180,18 @@ class Neo4jClient:
                 service_id=service_id,
                 entity_name=entity_name,
             )
-            return [dict(r) for r in result]
+            rows = []
+            for r in result:
+                d = dict(r)
+                pl = d.get("property_labels")
+                if isinstance(pl, str):
+                    try:
+                        import json as _json
+                        d["property_labels"] = _json.loads(pl)
+                    except Exception:
+                        d["property_labels"] = {}
+                rows.append(d)
+            return rows
 
     def find_entity_relationships(self, entity_name: str, service_id: str) -> List[Dict[str, Any]]:
         """Find all relationships for an entity (both directions)."""
@@ -196,7 +211,18 @@ class Neo4jClient:
                 service_id=service_id,
                 entity_name=entity_name,
             )
-            return [dict(r) for r in result]
+            rows = []
+            for r in result:
+                d = dict(r)
+                pl = d.get("property_labels")
+                if isinstance(pl, str):
+                    try:
+                        import json as _json
+                        d["property_labels"] = _json.loads(pl)
+                    except Exception:
+                        d["property_labels"] = {}
+                rows.append(d)
+            return rows
 
     def upsert_role_policy(self, role: Dict[str, Any]):
         if not self._driver:
@@ -231,7 +257,18 @@ class Neo4jClient:
                        e.created_at AS created_at
                 """
             )
-            return [dict(r) for r in result]
+            rows = []
+            for r in result:
+                d = dict(r)
+                pl = d.get("property_labels")
+                if isinstance(pl, str):
+                    try:
+                        import json as _json
+                        d["property_labels"] = _json.loads(pl)
+                    except Exception:
+                        d["property_labels"] = {}
+                rows.append(d)
+            return rows
 
     def get_service_entities(self, service_id: str) -> List[Dict[str, Any]]:
         """Get all entities for a service from Neo4j (used when metadata fetch fails)."""
@@ -242,11 +279,22 @@ class Neo4jClient:
                 """
                 MATCH (s:Service)-[:HAS_ENTITY]->(e:Entity)
                 WHERE s.id = $service_id AND (e.is_custom = false OR e.is_custom = 'false')
-                RETURN e.name AS name, e.type AS type, e.properties AS properties
+                RETURN e.name AS name, e.type AS type, e.properties AS properties, e.label AS label, e.property_labels AS property_labels
                 """,
                 service_id=service_id,
             )
-            return [dict(r) for r in result]
+            rows = []
+            for r in result:
+                d = dict(r)
+                pl = d.get("property_labels")
+                if isinstance(pl, str):
+                    try:
+                        import json as _json
+                        d["property_labels"] = _json.loads(pl)
+                    except Exception:
+                        d["property_labels"] = {}
+                rows.append(d)
+            return rows
 
     # --- Cross-Service Join ---
 
@@ -381,6 +429,22 @@ class Neo4jClient:
             record = result.single()
             return record["deleted"] > 0 if record else False
 
+    def delete_service(self, service_id: str) -> bool:
+        if not self._driver:
+            return False
+        with self._driver.session() as session:
+            result = session.run(
+                """
+                MATCH (s:Service {id: $service_id})
+                OPTIONAL MATCH (s)-[:HAS_ENTITY]->(e:Entity)
+                DETACH DELETE s, e
+                RETURN count(s) + count(e) AS deleted
+                """,
+                service_id=service_id,
+            )
+            record = result.single()
+            return record["deleted"] > 0 if record else False
+
     def find_services_for_entities(self, entity_names: List[str]) -> List[Dict[str, Any]]:
         if not self._driver:
             return []
@@ -395,7 +459,18 @@ class Neo4jClient:
                 """,
                 names=[n.lower() for n in entity_names],
             )
-            return [dict(r) for r in result]
+            rows = []
+            for r in result:
+                d = dict(r)
+                pl = d.get("property_labels")
+                if isinstance(pl, str):
+                    try:
+                        import json as _json
+                        d["property_labels"] = _json.loads(pl)
+                    except Exception:
+                        d["property_labels"] = {}
+                rows.append(d)
+            return rows
 
     def find_related_entities(self, service_id: str, entity_name: str) -> List[Dict[str, Any]]:
         if not self._driver:
@@ -415,7 +490,18 @@ class Neo4jClient:
                 service_id=service_id,
                 entity_name=entity_name,
             )
-            return [dict(r) for r in result]
+            rows = []
+            for r in result:
+                d = dict(r)
+                pl = d.get("property_labels")
+                if isinstance(pl, str):
+                    try:
+                        import json as _json
+                        d["property_labels"] = _json.loads(pl)
+                    except Exception:
+                        d["property_labels"] = {}
+                rows.append(d)
+            return rows
 
     def get_role_policy(self, role_id: str) -> Optional[Dict[str, Any]]:
         if not self._driver:
@@ -465,7 +551,18 @@ class Neo4jClient:
                        e.properties AS properties
                 """
             )
-            return [dict(r) for r in result]
+            rows = []
+            for r in result:
+                d = dict(r)
+                pl = d.get("property_labels")
+                if isinstance(pl, str):
+                    try:
+                        import json as _json
+                        d["property_labels"] = _json.loads(pl)
+                    except Exception:
+                        d["property_labels"] = {}
+                rows.append(d)
+            return rows
 
     def clear(self):
         if not self._driver:

@@ -56,12 +56,15 @@ class ODataServiceManager:
                         for ent in existing:
                             meta["entity_sets"].append({"name": ent["name"], "entity_type": ent.get("type", ent["name"])})
                             props = ent.get("properties", [])
+                            ent_label = ent.get("label", "")
+                            prop_labels = ent.get("property_labels", {})
                             if props:
                                 et_name = ent.get("type", ent["name"]).split(".")[-1]
                                 meta["entity_types"].append({
                                     "name": et_name,
                                     "namespace": "",
-                                    "properties": [{"name": p, "type": "Edm.String", "nullable": True} for p in props],
+                                    "label": ent_label,
+                                    "properties": [{"name": p, "type": "Edm.String", "nullable": True, "label": prop_labels.get(p, "")} for p in props],
                                 })
                 except Exception as ex:
                     logger.warning(f"Failed to recover entities from Neo4j for {service_id}: {ex}")
@@ -71,6 +74,7 @@ class ODataServiceManager:
                 "base_url": base_url,
                 "description": description,
                 "metadata": meta,
+                "metadata_xml": getattr(client, "metadata_xml", ""),
                 "extra": metadata or {},
                 "auth_type": auth_type,
                 "auth_config": auth_config,
@@ -103,14 +107,17 @@ class ODataServiceManager:
                 None,
             )
             props = et.get("properties", []) if et else []
+            entity_label = et.get("label", "") if et else ""
             allowed_ops = ["select", "filter", "expand", "orderby", "top", "skip"]
             g.upsert_entity({
                 "service_id": service_id,
                 "name": es["name"],
                 "type": et_name,
+                "label": entity_label,
                 "description": f"Entity set {es['name']} of {et_name}. {svc['description']}",
                 "allowed_ops": allowed_ops,
                 "properties": [p["name"] for p in props],
+                "property_labels": {p["name"]: p.get("label", "") for p in props},
             })
         for assoc in svc["metadata"].get("associations", []):
             for from_role, to_role in [("end1", "end2"), ("end2", "end1")]:
@@ -204,6 +211,7 @@ class ODataServiceManager:
         out = []
         for sid, svc in self._services.items():
             entity_props = {}
+            entity_labels = {}
             et_list = svc["metadata"].get("entity_types", [])
             et_names = {e["name"] for e in et_list}
             for es in svc["metadata"].get("entity_sets", []):
@@ -217,7 +225,12 @@ class ODataServiceManager:
                     # Try partial match: entity_type ends with entity set name
                     et = next((e for e in et_list if et_name.endswith(e["name"])), None)
                 props = [p["name"] for p in (et or {}).get("properties", [])]
+                prop_labels = {p["name"]: p.get("label", "") for p in (et or {}).get("properties", [])}
                 entity_props[es_name] = props
+                entity_labels[es_name] = {
+                    "entity_label": (et or {}).get("label", ""),
+                    "property_labels": prop_labels,
+                }
             out.append({
                 "id": sid,
                 "name": svc["name"],
@@ -225,6 +238,7 @@ class ODataServiceManager:
                 "description": svc["description"],
                 "entity_sets": [es["name"] for es in svc["metadata"].get("entity_sets", [])],
                 "entity_properties": entity_props,
+                "entity_labels": entity_labels,
             })
         return out
 
@@ -244,16 +258,16 @@ class ODataServiceManager:
         except Exception as e:
             logger.warning(f"Could not read services from graph: {e}")
             return
-        for svc in persisted:
+
+        async def _register_one(svc):
             sid = svc.get("id")
             base_url = svc.get("base_url")
             name = svc.get("name")
             description = svc.get("description", "")
             if not sid or not base_url:
-                continue
+                return
             if sid in self._services:
-                continue
-            # Recover auth credentials from Neo4j
+                return
             auth_type = svc.get("auth_type")
             auth_config_str = svc.get("auth_config")
             auth_config = None
@@ -276,6 +290,10 @@ class ODataServiceManager:
                 logger.info(f"  {sid}: recovered")
             except Exception as e:
                 logger.warning(f"  Failed to recover {sid}: {e}")
+
+        tasks = [_register_one(svc) for svc in persisted]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._recover_custom_entities(g)
 
     def _recover_custom_entities(self, g):
@@ -419,12 +437,33 @@ class ODataServiceManager:
             columns = columns[:40]
         cleaned_rows = [{k: v for k, v in r.items() if k in columns} for r in cleaned_rows]
 
+        # Build column_labels mapping from entity metadata
+        column_labels = {}
+        entity_set = plan.get("entity_set", "")
+        entity_labels = {}
+        for svc_data in self.list_services():
+            if svc_data["id"] == service_id:
+                entity_labels = svc_data.get("entity_labels", {})
+                break
+        labels_info = entity_labels.get(entity_set, {})
+        if not labels_info and entity_set:
+            es_lower = entity_set.lower()
+            for key, val in entity_labels.items():
+                if key.lower() == es_lower or key.lower().endswith(es_lower) or es_lower.endswith(key.lower()):
+                    labels_info = val
+                    break
+        prop_labels = labels_info.get("property_labels", {})
+        for col in columns:
+            if col in prop_labels and prop_labels[col]:
+                column_labels[col] = prop_labels[col]
+
         sanitized = {
             "columns": columns,
             "rows": cleaned_rows,
             "row_count": len(cleaned_rows),
             "truncated": (total_count or len(cleaned_rows)) > len(cleaned_rows),
             "total_count": total_count,
+            "column_labels": column_labels if column_labels else None,
         }
         return {
             "service_id": service_id,
@@ -540,6 +579,21 @@ class ODataServiceManager:
                 logger.warning(f"Failed to delete custom entity from graph: {e}")
             return True
         return False
+
+    def delete_service(self, service_id: str) -> bool:
+        if service_id not in self._services:
+            return False
+        del self._services[service_id]
+        self._clients.pop(service_id, None)
+        self._entity_to_set.pop(service_id, None)
+        self._custom_entities.pop(service_id, None)
+        try:
+            g = self.graph()
+            g.delete_service(service_id)
+        except Exception as e:
+            logger.warning(f"Failed to delete service from graph: {e}")
+        logger.info(f"Deleted service '{service_id}'")
+        return True
 
     def resolve_custom_entity(self, service_id: str, entity_set: str) -> Optional[Dict[str, Any]]:
         return self._custom_entities.get(service_id, {}).get(entity_set)

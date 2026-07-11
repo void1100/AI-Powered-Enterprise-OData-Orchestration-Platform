@@ -175,6 +175,8 @@ class InMemoryGraph:
                         "name": ent_name,
                         "type": ent.get("type", ent_name),
                         "properties": ent.get("properties", []),
+                        "label": ent.get("label", ""),
+                        "property_labels": ent.get("property_labels", {}),
                     })
             return out
 
@@ -185,6 +187,24 @@ class InMemoryGraph:
                 del self.entities[key]
                 return True
             return False
+
+    def delete_service(self, service_id: str) -> bool:
+        with self._lock:
+            if service_id not in self.services:
+                return False
+            del self.services[service_id]
+            keys_to_remove = [k for k in self.entities if k[0] == service_id]
+            for k in keys_to_remove:
+                del self.entities[k]
+            self.relationships = [
+                r for r in self.relationships
+                if r.get("from_service") != service_id and r.get("to_service") != service_id
+            ]
+            self.joins = {
+                jid: j for jid, j in self.joins.items()
+                if j.get("left_service") != service_id and j.get("right_service") != service_id
+            }
+            return True
 
     def list_all_entities(self) -> List[Dict[str, Any]]:
         with self._lock:

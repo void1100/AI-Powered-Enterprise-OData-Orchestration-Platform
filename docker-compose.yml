@@ -57,8 +57,10 @@ services:
     volumes:
       - backend_data:/app/data
       - chroma_cache:/root/.cache/chroma
+      - ./backend/app:/app/app
+      - ./backend/run.py:/app/run.py
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/ready || exit 1"]
       interval: 30s
       timeout: 10s
       start_period: 120s
@@ -80,6 +82,20 @@ services:
       interval: 30s
       timeout: 5s
       start_period: 5s
+      retries: 3
+
+  mock-writer:
+    build:
+      context: ./mock-odata-writer
+    container_name: odata-mock-writer
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5000/health >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
       retries: 3
 
   n8n:

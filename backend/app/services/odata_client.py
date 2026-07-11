@@ -7,11 +7,40 @@ doesn't include full type definitions (e.g. the public ODataSamples
 Northwind service).
 """
 import re
+import time
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 import httpx
 from loguru import logger
+
+
+class _QueryCache:
+    """Simple in-memory TTL cache for OData query results."""
+
+    def __init__(self, ttl: float = 60.0, max_size: int = 256):
+        self._cache: Dict[str, Tuple[float, Any]] = {}
+        self._ttl = ttl
+        self._max_size = max_size
+
+    def _make_key(self, entity_set: str, select, filter_expr, expand, top, skip, orderby) -> str:
+        return f"{entity_set}|{tuple(select or [])}|{filter_expr}|{tuple(expand or [])}|{top}|{skip}|{orderby}"
+
+    def get(self, entity_set: str, select, filter_expr, expand, top, skip, orderby) -> Optional[Any]:
+        key = self._make_key(entity_set, select, filter_expr, expand, top, skip, orderby)
+        entry = self._cache.get(key)
+        if entry and (time.monotonic() - entry[0]) < self._ttl:
+            return entry[1]
+        if entry:
+            del self._cache[key]
+        return None
+
+    def set(self, entity_set: str, select, filter_expr, expand, top, skip, orderby, value):
+        if len(self._cache) >= self._max_size:
+            oldest_key = min(self._cache, key=lambda k: self._cache[k][0])
+            del self._cache[oldest_key]
+        key = self._make_key(entity_set, select, filter_expr, expand, top, skip, orderby)
+        self._cache[key] = (time.monotonic(), value)
 
 
 NS = {
@@ -22,6 +51,7 @@ NS = {
     "app": "http://www.w3.org/2007/app",
     "atom": "http://www.w3.org/2005/Atom",
     "m": "http://docs.oasis-open.org/odata/ns/metadata",
+    "sap": "http://www.sap.com/Protocols/SAPData",
 }
 
 
@@ -30,10 +60,13 @@ def _strip_ns(tag: str) -> str:
 
 
 class ODataClient:
+    _query_cache = _QueryCache(ttl=60.0, max_size=256)
+
     def __init__(self, base_url: str, timeout: float = 30.0, auth_type: str = None, auth_config: Dict[str, str] = None):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self._metadata_cache: Optional[Dict[str, Any]] = None
+        self._metadata_xml: str = ""
         self._sampled: bool = False
         self._client: Optional[httpx.AsyncClient] = None
         self._auth_type = auth_type
@@ -84,10 +117,16 @@ class ODataClient:
         resp = await client.get(url, headers=headers)
         resp.raise_for_status()
         xml_text = resp.text
+        self._metadata_xml = xml_text
         meta = self._parse_metadata(xml_text)
         await self._enrich_by_sampling(meta)
         self._metadata_cache = meta
         return self._metadata_cache
+
+    @property
+    def metadata_xml(self) -> str:
+        """Return raw $metadata XML text (for column priority parsing)."""
+        return self._metadata_xml
 
     def _parse_metadata(self, xml_text: str) -> Dict[str, Any]:
         root = ET.fromstring(xml_text)
@@ -116,12 +155,17 @@ class ODataClient:
                 name = et.attrib.get("Name")
                 if not name:
                     continue
+                # Extract sap:label for entity type
+                entity_label = et.attrib.get(f"{{{NS['sap']}}}label", "")
                 props = []
                 for prop in et.findall(f"{{{edm_ns}}}Property"):
+                    # Extract sap:label for property
+                    prop_label = prop.attrib.get(f"{{{NS['sap']}}}label", "")
                     props.append({
                         "name": prop.attrib.get("Name"),
                         "type": prop.attrib.get("Type"),
                         "nullable": prop.attrib.get("Nullable", "true") == "true",
+                        "label": prop_label,
                     })
                 keys = [n.text for n in et.findall(f"{{{edm_ns}}}Key/{{{edm_ns}}}PropertyRef")]
                 nav_props = []
@@ -134,6 +178,7 @@ class ODataClient:
                 entity_types[name] = {
                     "name": name,
                     "namespace": ns,
+                    "label": entity_label,
                     "properties": props,
                     "keys": keys,
                     "navigation_properties": nav_props,
@@ -324,6 +369,9 @@ class ODataClient:
         skip: Optional[int] = None,
         orderby: Optional[str] = None,
     ) -> Dict[str, Any]:
+        cached = self._query_cache.get(entity_set, select, filter_expr, expand, top, skip, orderby)
+        if cached is not None:
+            return cached
         url = self._build_url(
             entity_set, select=select, filter_expr=filter_expr,
             expand=expand, top=top, skip=skip, orderby=orderby, count=True,
@@ -334,6 +382,7 @@ class ODataClient:
         resp = await client.get(url, headers=headers)
         resp.raise_for_status()
         data = resp.json()
+        self._query_cache.set(entity_set, select, filter_expr, expand, top, skip, orderby, data)
         return data
 
     async def get_by_id(self, entity_set: str, entity_id: str, select: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
@@ -347,6 +396,49 @@ class ODataClient:
             return None
         resp.raise_for_status()
         return resp.json()
+
+    # ─── Write Operations ────────────────────────────────────────────────
+    async def create(self, entity_set: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """POST a new entity to the OData service."""
+        url = f"{self._get_data_base_url()}/{entity_set}"
+        client = await self._get_client()
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        headers.update(self._get_auth_headers())
+        resp = await client.post(url, json=data, headers=headers)
+        resp.raise_for_status()
+        if resp.status_code == 201:
+            return resp.json()
+        return {"status": resp.status_code, "success": True}
+
+    async def update(
+        self, entity_set: str, entity_id: str, data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """PATCH an existing entity."""
+        url = f"{self._get_data_base_url()}/{entity_set}({entity_id})"
+        client = await self._get_client()
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        headers.update(self._get_auth_headers())
+        resp = await client.patch(url, json=data, headers=headers)
+        resp.raise_for_status()
+        if resp.status_code == 204:
+            return {"success": True, "operation": "update"}
+        return resp.json()
+
+    async def delete(self, entity_set: str, entity_id: str) -> Dict[str, Any]:
+        """DELETE an entity."""
+        url = f"{self._get_data_base_url()}/{entity_set}({entity_id})"
+        client = await self._get_client()
+        headers = {"Accept": "application/json"}
+        headers.update(self._get_auth_headers())
+        resp = await client.delete(url, headers=headers)
+        resp.raise_for_status()
+        return {"success": True, "operation": "delete"}
 
     @staticmethod
     def flatten_odata_value(value: Any) -> List[Dict[str, Any]]:

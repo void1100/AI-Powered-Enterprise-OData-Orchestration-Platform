@@ -51,6 +51,7 @@
         <h1>Advanced OData Service Orchestration</h1>
         <div class="topbar-actions">
           <button id="entitySelectorBtn" class="icon-btn" title="Select Entities">Select Entities</button>
+          <button id="writeHistoryBtn" class="icon-btn" title="Write History">Write Log</button>
           <button id="themeToggle" class="icon-btn" title="Toggle dark mode" aria-label="Toggle dark mode">
             <span class="theme-icon-light">☀</span>
             <span class="theme-icon-dark">☾</span>
@@ -156,6 +157,39 @@
         <div class="entity-panel-footer">
           <span id="entitySelectedCount">0 entities selected</span>
           <button id="executeEntityJoin" class="execute-join-btn" disabled>Execute Join</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Write Confirmation Modal -->
+    <div id="writeConfirmModal" class="modal hidden">
+      <div class="modal-content write-confirm-modal">
+        <header>
+          <h2 id="writeConfirmTitle">Confirm Write Operation</h2>
+          <button class="close" id="closeWriteConfirm">x</button>
+        </header>
+        <div class="write-confirm-body">
+          <div class="write-confirm-summary" id="writeConfirmSummary"></div>
+          <div class="write-confirm-fields" id="writeConfirmFields"></div>
+          <div class="write-confirm-status" id="writeConfirmStatus"></div>
+          <div class="write-confirm-actions">
+            <button id="writeConfirmCancel" class="btn-cancel">Cancel</button>
+            <button id="writeConfirmExecute" class="btn-execute">Execute</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Write History Modal -->
+    <div id="writeHistoryModal" class="modal hidden">
+      <div class="modal-content write-history-modal">
+        <header>
+          <h2>Write Operation History</h2>
+          <button class="close" id="closeWriteHistory">x</button>
+        </header>
+        <div class="write-history-body">
+          <div class="write-history-stats" id="writeHistoryStats"></div>
+          <div class="write-history-list" id="writeHistoryList"></div>
         </div>
       </div>
     </div>

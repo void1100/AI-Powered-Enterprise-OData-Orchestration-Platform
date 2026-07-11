@@ -13,14 +13,14 @@ ROLE_PRESETS: Dict[str, Dict[str, Any]] = {
     "Admin": {
         "id": "Admin",
         "name": "Admin",
-        "allowed_ops": ["select", "filter", "expand", "orderby", "top", "skip"],
+        "allowed_ops": ["select", "filter", "expand", "orderby", "top", "skip", "create", "update", "delete"],
         "allowed_entities": [],
         "allowed_services": [],
     },
     "Sales": {
         "id": "Sales",
         "name": "Sales",
-        "allowed_ops": ["select", "filter", "expand", "orderby", "top", "skip"],
+        "allowed_ops": ["select", "filter", "expand", "orderby", "top", "skip", "create", "update"],
         "allowed_entities": ["Customers", "Orders", "Products"],
         "allowed_services": [],
     },

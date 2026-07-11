@@ -18,6 +18,17 @@ let isLoading = false;
 let currentPaginationSession = null;
 let currentTableData = null;
 
+function renderMarkdown(text) {
+  if (!text) return "";
+  let html = escapeHtml(text);
+  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
+  html = html.replace(/(<li>.*<\/li>\n?)+/gs, '<ul>$&</ul>');
+  html = html.replace(/\n/g, '<br>');
+  return html;
+}
+
 const $ = (id) => document.getElementById(id);
 const messagesEl = $("messages");
 const sessionList = $("sessionList");
@@ -50,7 +61,12 @@ async function api(path, opts = {}) {
   });
   if (!res.ok) {
     let detail = `HTTP ${res.status}`;
-    try { detail = (await res.json()).detail || detail; } catch {}
+    try {
+      const body = await res.json();
+      detail = Array.isArray(body.detail)
+        ? body.detail.map(d => d.msg || String(d)).join(", ")
+        : (body.detail || detail);
+    } catch {}
     throw new Error(detail);
   }
   return res.json();
@@ -147,7 +163,7 @@ function addUserBubble(text, scroll = true) {
 function addAssistantBubble(summary, result, scroll = true, paginationInfo = null) {
   const div = document.createElement("div");
   div.className = "bubble assistant";
-  div.textContent = summary || "Done.";
+  div.innerHTML = renderMarkdown(summary || "Done.");
   try {
   if (result && result.llm) {
     const badge = document.createElement("div");
@@ -169,7 +185,7 @@ function addAssistantBubble(summary, result, scroll = true, paginationInfo = nul
       div.appendChild(panel.panelEl);
       tableWrap.style.display = "";
       panel.tableView.appendChild(tableWrap);
-      panel.setTableRef(tableWrap.querySelector("table"));
+      panel.setTableRef(tableWrap.querySelector("table"), tableWrap);
       requestAnimationFrame(() => { try { panel.renderGraph(); } catch(e) { console.error("Graph render error:", e); } });
     }
   }
@@ -310,21 +326,31 @@ function renderInsightsPanel(bubbleDiv, data) {
   }
 
   if (data.chart_insights && data.chart_insights.length) {
-    html += `<div class="insights-section"><div class="insights-label">Chart Suggestions</div><ul>`;
-    data.chart_insights.forEach(c => { html += `<li>${escapeHtml(c)}</li>`; });
-    html += `</ul></div>`;
+    html += `<div class="insights-section"><div class="insights-label">Chart Suggestions</div><div class="insights-suggestions">`;
+    data.chart_insights.forEach(c => { html += `<button class="insight-suggestion-chip chart-suggestion" data-suggestion="${escapeHtml(c)}">${escapeHtml(c)}</button>`; });
+    html += `</div></div>`;
   }
 
   if (data.suggestions && data.suggestions.length) {
     html += `<div class="insights-section"><div class="insights-label">Try Next</div><div class="insights-suggestions">`;
     data.suggestions.forEach(s => {
-      html += `<button class="insight-suggestion-chip" onclick="document.getElementById('queryInput').value='${escapeHtml(s)}';document.getElementById('queryInput').focus()">${escapeHtml(s)}</button>`;
+      html += `<button class="insight-suggestion-chip" data-suggestion="${escapeHtml(s)}">${escapeHtml(s)}</button>`;
     });
     html += `</div></div>`;
   }
 
   panel.innerHTML = html;
   bubbleDiv.appendChild(panel);
+
+  // Bind suggestion chips to auto-send
+  panel.querySelectorAll(".insight-suggestion-chip").forEach(chip => {
+    chip.addEventListener("click", () => {
+      const query = chip.dataset.suggestion;
+      if (!query) return;
+      document.getElementById("queryInput").value = query;
+      document.getElementById("sendBtn").click();
+    });
+  });
 }
 
 function tableToCsv(table) {
@@ -398,9 +424,13 @@ function renderTable(table, paginationInfo = null) {
   const tableEl = document.createElement("table");
   const thead = document.createElement("thead");
   const trh = document.createElement("tr");
+  // Use column_labels for display if available
+  const colLabels = table.column_labels || {};
   table.columns.forEach((c) => {
     const th = document.createElement("th");
-    th.textContent = c;
+    // Show label if available, otherwise show technical name
+    th.textContent = colLabels[c] || c;
+    th.title = c; // Show technical name on hover
     trh.appendChild(th);
   });
   thead.appendChild(trh);
@@ -1414,54 +1444,90 @@ function buildResultPanel(table) {
   const tabsEl = document.createElement("div");
   tabsEl.className = "result-tabs";
 
-  // Column picker in header
-  // Column toggle button — shows all columns or only filtered
-  const allColumns = [...table.columns];
-  const tableRef = { el: null };
+  // Column toggle: business-safe default view or full raw result.
+  const hasFullData = !!(table.all_columns && table.all_rows);
+  const fullColumns = table.all_columns || table.columns;
+  const fullRows = table.all_rows || table.rows;
+  const filteredColumns = table.columns;
+  const filteredRows = table.rows;
+  const hiddenColumns = table.hidden_columns || [];
+  const columnLabels = table.column_labels || {};
+  const tableRef = { el: null, wrap: null };
   let showingAll = false;
 
-  const colBtn = document.createElement("button");
-  colBtn.className = "col-toggle-btn";
-  colBtn.textContent = `Show All Columns (${allColumns.length})`;
-  colBtn.title = "Toggle all columns on/off";
-  colBtn.addEventListener("click", () => {
-    if (!tableRef.el) return;
-    showingAll = !showingAll;
-    if (showingAll) {
-      // Show all columns — unhide everything
-      updateTableVisibility(tableRef.el, allColumns, new Set());
-      colBtn.textContent = `Show Filtered (${allColumns.length})`;
-      colBtn.classList.add("active");
-    } else {
-      // Re-apply filter — hide useless columns
-      const useless = new Set();
-      const rows = [];
-      const trs = tableRef.el.querySelectorAll("tbody tr");
-      trs.forEach(tr => {
-        const row = {};
-        const tds = tr.querySelectorAll("td");
-        tds.forEach((td, i) => { row[allColumns[i]] = td.textContent; });
-        rows.push(row);
-      });
-      allColumns.forEach(col => {
-        if (isUselessCol(col, rows)) useless.add(col);
-      });
-      updateTableVisibility(tableRef.el, allColumns, useless);
-      colBtn.textContent = `Show All Columns (${allColumns.length})`;
-      colBtn.classList.remove("active");
-    }
-  });
-  tabsEl.appendChild(colBtn);
+  // Smart view: priority-filtered columns (top 15-20 from SAP annotations)
+  const smartColumns = table.smart_columns || filteredColumns;
+  const smartRows = table.smart_rows || filteredRows;
+  let currentView = "smart"; // "smart" | "filtered" | "all"
 
-  function isUselessCol(col, rows) {
-    if (!rows.length) return false;
-    const vals = rows.map(r => (r[col] || "").trim());
-    const unique = new Set(vals);
-    if (unique.size <= 1) return true;
-    const empty = vals.filter(v => v === "" || v === "0" || v === "0.0" || v === "0.00" || v.startsWith("000000000")).length;
-    if (empty / vals.length >= 0.95) return true;
-    if (/InternalNumber|CharcInternal|ConfigurableProd|ProdCharc/i.test(col)) return true;
-    return false;
+  function getColumnsForView(view) {
+    if (view === "all") return { columns: fullColumns, rows: fullRows };
+    if (view === "filtered") return { columns: filteredColumns, rows: filteredRows };
+    return { columns: smartColumns, rows: smartRows };
+  }
+
+  function getViewLabel(view) {
+    if (view === "all") return `All (${fullColumns.length})`;
+    if (view === "filtered") return `Key (${filteredColumns.length})`;
+    return `Smart (${smartColumns.length})`;
+  }
+
+  if (hasFullData && fullColumns.length > smartColumns.length) {
+    const colToggle = document.createElement("div");
+    colToggle.className = "col-toggle-group";
+
+    const views = ["smart", "filtered", "all"];
+    views.forEach((view) => {
+      const btn = document.createElement("button");
+      btn.className = "col-toggle-btn" + (view === currentView ? " active" : "");
+      btn.textContent = getViewLabel(view);
+      btn.dataset.view = view;
+      const counts = getColumnsForView(view);
+      const hidden = fullColumns.length - counts.columns.length;
+      btn.title = view === "all"
+        ? `Show all ${fullColumns.length} columns`
+        : `Show ${counts.columns.length} columns (${hidden} hidden)`;
+      btn.addEventListener("click", () => {
+        if (view === currentView) return;
+        currentView = view;
+        const data = getColumnsForView(view);
+        const newTable = {
+          columns: data.columns,
+          rows: data.rows,
+          row_count: data.rows.length,
+          column_labels: columnLabels,
+          hidden_columns: view === "all" ? [] : hiddenColumns,
+          filter_note: table.filter_note,
+        };
+        const newWrap = renderTable(newTable);
+        if (newWrap) {
+          tableRef.wrap.replaceWith(newWrap);
+          tableRef.wrap = newWrap;
+          tableRef.el = newWrap.querySelector("table");
+        }
+        colToggle.querySelectorAll(".col-toggle-btn").forEach((b) => {
+          b.classList.toggle("active", b.dataset.view === view);
+        });
+      });
+      colToggle.appendChild(btn);
+    });
+    tabsEl.appendChild(colToggle);
+  } else {
+    const colBtn = document.createElement("button");
+    colBtn.className = "col-toggle-btn";
+    colBtn.textContent = `Columns (${filteredColumns.length})`;
+    colBtn.title = table.filter_note || "All columns shown";
+    colBtn.disabled = true;
+    colBtn.style.opacity = "0.5";
+    tabsEl.appendChild(colBtn);
+  }
+
+  if (hiddenColumns.length) {
+    const hiddenHint = document.createElement("span");
+    hiddenHint.className = "hidden-columns-hint";
+    hiddenHint.textContent = `${hiddenColumns.length} hidden`;
+    hiddenHint.title = hiddenColumns.map((c) => `${c.name}: ${c.reason || "hidden"}`).join("\n");
+    tabsEl.appendChild(hiddenHint);
   }
 
   const tableTab = document.createElement("button");
@@ -1611,7 +1677,7 @@ function buildResultPanel(table) {
       analyzeView.dataset.loaded = "1";
     }
   });
-  return { panelEl, tableView, renderGraph, setTableRef: (el) => { tableRef.el = el; } };
+  return { panelEl, tableView, renderGraph, setTableRef: (el, wrap) => { tableRef.el = el; tableRef.wrap = wrap || el?.parentElement; } };
 }
 
 function rerenderAllCharts() {
@@ -1697,30 +1763,88 @@ async function send() {
   queryInput.value = "";
   const processingEl = addProcessingBubble("Processing your query...");
   try {
-    const resp = await api("/chat", {
-      method: "POST",
-      body: {
-        query: q,
-        session_id: currentSessionId,
-        user_role: roleSelect.value,
-        selected_entities: selectedEntities.length > 0 ? selectedEntities : undefined,
-      },
-    });
-    removeProcessingBubble();
-    currentSessionId = resp.session_id;
-    lastSummary = resp.summary;
-    lastTable = resp.table;
-    addAssistantBubble(resp.summary, {
-      table: resp.table,
-      tool_calls: resp.tool_calls,
-      llm: {
-        provider: resp.llm_provider,
-        latency_ms: resp.llm_latency_ms,
-        tokens: resp.llm_tokens,
-        corrected: (resp.tool_calls || []).some((t) => t.corrected),
-        intent: resp.intent,
-      },
-    });
+    // Detect write intents client-side to show preview first
+    const writeKeywords = /\b(create|add|new|insert|update|modify|change|delete|remove)\b/i;
+    const isWriteIntent = writeKeywords.test(q);
+
+    if (isWriteIntent) {
+      // Try write preview first
+      try {
+        const previewResp = await api("/chat/write/preview", {
+          method: "POST",
+          body: {
+            query: q,
+            session_id: currentSessionId,
+            user_role: roleSelect.value,
+          },
+        });
+        removeProcessingBubble();
+        if (previewResp.error) {
+          addAssistantBubble(previewResp.error, null, true);
+        } else if (previewResp.preview) {
+          openWriteConfirmModal(previewResp);
+          addAssistantBubble(previewResp.confirmation_summary || "Write operation ready. Please confirm.", null, true);
+        }
+      } catch (previewErr) {
+        // If preview fails, fall through to normal chat
+        const resp = await api("/chat", {
+          method: "POST",
+          body: {
+            query: q,
+            session_id: currentSessionId,
+            user_role: roleSelect.value,
+            selected_entities: selectedEntities.length > 0 ? selectedEntities : undefined,
+          },
+        });
+        removeProcessingBubble();
+        currentSessionId = resp.session_id;
+        lastSummary = resp.summary;
+        lastTable = resp.table;
+
+        // Check if response contains write_preview (guardrails blocked with missing fields)
+        if (resp.write_preview) {
+          openWriteConfirmModal(resp.write_preview);
+          addAssistantBubble(resp.write_preview.confirmation_summary || resp.summary, null, true);
+        } else {
+          addAssistantBubble(resp.summary, {
+            table: resp.table,
+            tool_calls: resp.tool_calls,
+            llm: {
+              provider: resp.llm_provider,
+              latency_ms: resp.llm_latency_ms,
+              tokens: resp.llm_tokens,
+              corrected: (resp.tool_calls || []).some((t) => t.corrected),
+              intent: resp.intent,
+            },
+          });
+        }
+      }
+    } else {
+      const resp = await api("/chat", {
+        method: "POST",
+        body: {
+          query: q,
+          session_id: currentSessionId,
+          user_role: roleSelect.value,
+          selected_entities: selectedEntities.length > 0 ? selectedEntities : undefined,
+        },
+      });
+      removeProcessingBubble();
+      currentSessionId = resp.session_id;
+      lastSummary = resp.summary;
+      lastTable = resp.table;
+      addAssistantBubble(resp.summary, {
+        table: resp.table,
+        tool_calls: resp.tool_calls,
+        llm: {
+          provider: resp.llm_provider,
+          latency_ms: resp.llm_latency_ms,
+          tokens: resp.llm_tokens,
+          corrected: (resp.tool_calls || []).some((t) => t.corrected),
+          intent: resp.intent,
+        },
+      });
+    }
     loadSessions();
   } catch (e) {
     removeProcessingBubble();
@@ -1928,8 +2052,17 @@ async function loadServices() {
       del.textContent = "Remove";
       del.addEventListener("click", async () => {
         if (!confirm(`Remove ${s.name}?`)) return;
-        await api(`/services/${s.id}`, { method: "DELETE" });
-        loadServices();
+        try {
+          await api(`/services/${s.id}`, { method: "DELETE" });
+          loadServices();
+        } catch (e) {
+          const msg = e.message || "";
+          if (msg.includes("403") || msg.includes("Admin")) {
+            alert("You must be logged in as admin to remove services.\n\nLogin at /admin first, then return here.");
+          } else {
+            alert("Failed to remove service: " + msg);
+          }
+        }
       });
       li.appendChild(del);
       serviceListEl.appendChild(li);
@@ -2126,6 +2259,9 @@ closeEntityPanel.addEventListener("click", () => {
   entityPanelOpen = false;
 });
 
+const writeHistoryBtn = $("writeHistoryBtn");
+writeHistoryBtn.addEventListener("click", openWriteHistoryModal);
+
 function toggleEntityPanel() {
   entityPanelOpen = !entityPanelOpen;
   entityPanel.classList.toggle("hidden", !entityPanelOpen);
@@ -2174,7 +2310,7 @@ function renderEntityList(entities) {
   entityList.innerHTML = "";
   const search = entitySearch.value.toLowerCase();
   const filtered = search
-    ? entities.filter((e) => e.name.toLowerCase().includes(search))
+    ? entities.filter((e) => e.name.toLowerCase().includes(search) || (e.label || "").toLowerCase().includes(search))
     : entities;
   filtered.forEach((ent) => {
     const isSelected = selectedEntities.some(
@@ -2190,11 +2326,13 @@ function renderEntityList(entities) {
     const labelTags = Object.entries(labelCounts)
       .map(([lbl, cnt]) => `<span class="prop-label-tag prop-label-${lbl.toLowerCase()}">${lbl}: ${cnt}</span>`)
       .join("");
+    // Show label if available, otherwise show technical name
+    const displayName = ent.label ? `${ent.label} (${ent.name})` : ent.name;
     const item = document.createElement("label");
     item.className = "entity-checkbox-item";
     item.innerHTML = `
       <input type="checkbox" ${isSelected ? "checked" : ""} data-entity="${ent.name}" />
-      <span>${escapeHtml(ent.name)}</span>
+      <span>${escapeHtml(displayName)}</span>
       <span class="entity-props">${ent.property_count} props</span>
       <div class="prop-labels">${labelTags}</div>
     `;
@@ -2324,3 +2462,168 @@ executeEntityJoinBtn.addEventListener("click", async () => {
   executeEntityJoinBtn.textContent = "Execute Join";
   updateEntityCount();
 });
+
+// ─── Write Confirmation Dialog ────────────────────────────────────────────────
+const writeConfirmModal = $("writeConfirmModal");
+const closeWriteConfirm = $("closeWriteConfirm");
+const writeConfirmTitle = $("writeConfirmTitle");
+const writeConfirmSummary = $("writeConfirmSummary");
+const writeConfirmFields = $("writeConfirmFields");
+const writeConfirmStatus = $("writeConfirmStatus");
+const writeConfirmCancel = $("writeConfirmCancel");
+const writeConfirmExecute = $("writeConfirmExecute");
+const writeHistoryModal = $("writeHistoryModal");
+const closeWriteHistory = $("closeWriteHistory");
+
+let pendingWriteOp = null;
+
+function openWriteConfirmModal(data) {
+  pendingWriteOp = data;
+  const op = data.operation || "create";
+  const opLabels = { create: "Create", update: "Update", delete: "Delete" };
+  const opClass = `op-${op}`;
+  writeConfirmTitle.textContent = `${opLabels[op] || op} Confirmation`;
+
+  let summaryHtml = `<span class="op-label ${opClass}">${op}</span> `;
+  summaryHtml += `<strong>${escapeHtml(data.entity_set || "")}</strong> `;
+  summaryHtml += `<span style="color:var(--text-muted)">on ${escapeHtml(data.service_id || "")}</span>`;
+  if (data.fields && Object.keys(data.fields).length > 0) {
+    summaryHtml += `<br><br><strong>Fields:</strong><br>`;
+    for (const [k, v] of Object.entries(data.fields)) {
+      summaryHtml += `<code>${escapeHtml(k)}</code>: ${escapeHtml(String(v))}<br>`;
+    }
+  }
+  writeConfirmSummary.innerHTML = summaryHtml;
+
+  // Render missing required fields as inputs
+  const missing = data.missing_fields || [];
+  const required = data.required_fields || [];
+  const optional = data.optional_fields || [];
+  let fieldsHtml = "";
+
+  if (missing.length > 0) {
+    fieldsHtml += `<div style="margin-bottom:8px;font-size:12px;color:var(--warning)">Please provide the required fields:</div>`;
+    missing.forEach((f) => {
+      fieldsHtml += `<label class="field-required">${escapeHtml(f)}</label>`;
+      fieldsHtml += `<input type="text" data-field="${escapeHtml(f)}" placeholder="Enter ${escapeHtml(f)}" />`;
+    });
+  }
+
+  if (required.length > 0 && missing.length === 0) {
+    fieldsHtml += `<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Required fields are already provided.</div>`;
+  }
+
+  if (optional.length > 0) {
+    fieldsHtml += `<div style="margin-top:10px;font-size:11px;color:var(--text-muted)">Optional fields: ${optional.slice(0, 8).join(", ")}${optional.length > 8 ? "..." : ""}</div>`;
+  }
+
+  writeConfirmFields.innerHTML = fieldsHtml;
+  writeConfirmStatus.textContent = "";
+  writeConfirmStatus.className = "write-confirm-status";
+  writeConfirmExecute.disabled = false;
+  writeConfirmModal.classList.remove("hidden");
+}
+
+function closeWriteConfirmModal() {
+  writeConfirmModal.classList.add("hidden");
+  pendingWriteOp = null;
+}
+
+closeWriteConfirm.addEventListener("click", closeWriteConfirmModal);
+writeConfirmCancel.addEventListener("click", closeWriteConfirmModal);
+
+writeConfirmExecute.addEventListener("click", async () => {
+  if (!pendingWriteOp) return;
+
+  // Collect values from any dynamically added input fields
+  const inputs = writeConfirmFields.querySelectorAll("input[data-field]");
+  const extraFields = {};
+  inputs.forEach((inp) => {
+    const val = inp.value.trim();
+    if (val) extraFields[inp.dataset.field] = val;
+  });
+
+  const mergedFields = { ...(pendingWriteOp.fields || {}), ...extraFields };
+  const op = {
+    operation: pendingWriteOp.operation,
+    entity_set: pendingWriteOp.entity_set,
+    service_id: pendingWriteOp.service_id,
+    entity_id: pendingWriteOp.entity_id || "",
+    fields: mergedFields,
+  };
+
+  writeConfirmStatus.textContent = "Executing...";
+  writeConfirmStatus.className = "write-confirm-status";
+  writeConfirmExecute.disabled = true;
+
+  try {
+    const resp = await api("/chat/write/execute", {
+      method: "POST",
+      body: { query: JSON.stringify(op), session_id: currentSessionId },
+    });
+    if (resp.error) {
+      writeConfirmStatus.textContent = `Error: ${resp.error}`;
+      writeConfirmStatus.className = "write-confirm-status error";
+      writeConfirmExecute.disabled = false;
+    } else {
+      writeConfirmStatus.textContent = resp.summary || "Operation completed successfully.";
+      writeConfirmStatus.className = "write-confirm-status success";
+      addAssistantBubble(resp.summary || "Write operation completed.", null, true);
+      setTimeout(closeWriteConfirmModal, 2000);
+    }
+  } catch (e) {
+    writeConfirmStatus.textContent = `Failed: ${e.message}`;
+    writeConfirmStatus.className = "write-confirm-status error";
+    writeConfirmExecute.disabled = false;
+  }
+});
+
+// ─── Write History Modal ──────────────────────────────────────────────────────
+function openWriteHistoryModal() {
+  writeHistoryModal.classList.remove("hidden");
+  loadWriteHistory();
+}
+
+function closeWriteHistoryModal() {
+  writeHistoryModal.classList.add("hidden");
+}
+
+closeWriteHistory.addEventListener("click", closeWriteHistoryModal);
+
+async function loadWriteHistory() {
+  const statsEl = $("writeHistoryStats");
+  const listEl = $("writeHistoryList");
+  try {
+    const data = await api("/write/history?limit=50");
+    const stats = data.stats || {};
+    statsEl.innerHTML = `
+      <div class="write-history-stat"><div class="stat-num">${stats.total || 0}</div><div class="stat-label">Total</div></div>
+      <div class="write-history-stat"><div class="stat-num" style="color:var(--success)">${stats.creates || 0}</div><div class="stat-label">Creates</div></div>
+      <div class="write-history-stat"><div class="stat-num" style="color:var(--warning)">${stats.updates || 0}</div><div class="stat-label">Updates</div></div>
+      <div class="write-history-stat"><div class="stat-num" style="color:var(--danger)">${stats.deletes || 0}</div><div class="stat-label">Deletes</div></div>
+      <div class="write-history-stat"><div class="stat-num" style="color:var(--danger)">${stats.blocked || 0}</div><div class="stat-label">Blocked</div></div>
+    `;
+    const history = data.history || [];
+    if (history.length === 0) {
+      listEl.innerHTML = `<div class="write-history-empty">No write operations recorded yet.</div>`;
+      return;
+    }
+    listEl.innerHTML = history.map((h) => {
+      const t = new Date(h.timestamp * 1000);
+      const timeStr = t.toLocaleString();
+      const statusClass = h.success ? "success" : "blocked";
+      const statusText = h.success ? "OK" : "BLOCKED";
+      return `
+        <div class="write-history-item">
+          <span class="wh-op ${h.operation}">${h.operation}</span>
+          <span class="wh-entity">${escapeHtml(h.entity_set)}</span>
+          <span class="wh-status ${statusClass}">${statusText}</span>
+          <span class="wh-time">${timeStr}</span>
+        </div>
+      `;
+    }).join("");
+  } catch (e) {
+    statsEl.innerHTML = "";
+    listEl.innerHTML = `<div class="write-history-empty">Failed to load history: ${escapeHtml(e.message)}</div>`;
+  }
+}

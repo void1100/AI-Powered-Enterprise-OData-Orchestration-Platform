@@ -12,6 +12,7 @@ from app.agents.policy_engine import policy_engine
 from app.db.vector_store import vector_store
 from app.services.service_manager import service_manager
 from app.services.column_filter import filter_columns
+from app.services.guardrails import run_input_guards, run_output_guards
 
 
 TOP_SAFETY_CAP = 200
@@ -226,6 +227,136 @@ class Orchestrator:
             else:
                 error_message = f"No trained model available for '{entity_key}'. Query the data first to enable predictions."
 
+        # Handle write intents (create/update/delete)
+        write_intents = {"create", "update", "delete"}
+        if plan.get("intent") in write_intents:
+            write_op = plan.get("write_operation", {})
+            entity_set = write_op.get("entity_set", "")
+            operation = write_op.get("operation", plan.get("intent"))
+            fields = write_op.get("fields", {})
+            entity_id = write_op.get("entity_id")
+            service_id = write_op.get("service_id") or (plan.get("target_services", [None])[0] if plan.get("target_services") else None)
+
+            # If LLM didn't provide write_operation, try to detect entity from discovery
+            if not write_op or not entity_set:
+                # Try to detect entity from the query
+                from app.services.guardrails import get_entity_field_requirements
+                discovery_data = discovery or {}
+                entities_found = discovery_data.get("entities", [])
+                if entities_found:
+                    # Pick the first entity found
+                    entity_set = entities_found[0].get("entity_set", "")
+                    service_id = entities_found[0].get("service_id", service_id)
+
+            # Get entity field requirements
+            from app.services.guardrails import get_entity_field_requirements
+            field_reqs = get_entity_field_requirements(service_id, entity_set) if service_id and entity_set else {}
+            entity_required = field_reqs.get("required_fields", [])
+
+            # Run input guards
+            guard_result = run_input_guards(
+                user_role=user_role,
+                user_id=session_id or "anonymous",
+                entity_set=entity_set,
+                operation=operation,
+                fields=fields,
+                required_fields=entity_required,
+                confirmed=write_op.get("confirmed", False),
+            )
+            if not guard_result.allow:
+                # Return write info so frontend can show the confirmation modal
+                return {
+                    "run_id": run_id,
+                    "session_id": session_id,
+                    "user_query": user_query,
+                    "user_role": user_role,
+                    "summary": f"**{operation.title()}** requires confirmation. Please fill in the required fields.",
+                    "plan": plan,
+                    "discovery": discovery,
+                    "tool_calls": [{"type": "guardrail_block", "reason": guard_result.reason}],
+                    "blocked_steps": [],
+                    "table": None,
+                    "primary_url": None,
+                    "primary_service": service_id,
+                    "error": None,
+                    "memory_used": memory,
+                    "llm_provider": llm_provider,
+                    "llm_latency_ms": llm_latency_ms,
+                    "llm_tokens": llm_tokens,
+                    "write_preview": {
+                        "preview": True,
+                        "operation": operation,
+                        "entity_set": entity_set,
+                        "service_id": service_id,
+                        "fields": fields,
+                        "entity_id": entity_id,
+                        "required_fields": entity_required,
+                        "optional_fields": field_reqs.get("optional_fields", [])[:10],
+                        "auto_generated_fields": field_reqs.get("auto_generated_fields", []),
+                        "missing_fields": [f for f in entity_required if f not in fields or not fields.get(f)],
+                        "confirmation_summary": f"**{operation.title()}** record in `{entity_set}` ({service_id}).\n\nRequired fields missing. Please provide the required values.",
+                        "needs_user_input": True,
+                    },
+                }
+
+            # Execute write operation
+            try:
+                from app.services.odata_client import ODataClient
+                svc = service_manager._services.get(service_id, {})
+                if not svc:
+                    error_message = f"Service '{service_id}' not found"
+                else:
+                    client = ODataClient(svc.get("base_url", ""), auth_type=svc.get("auth_type"), auth_config=svc.get("auth_config"))
+                    if operation == "create":
+                        result = await client.create(entity_set, fields)
+                    elif operation == "update":
+                        if not entity_id:
+                            error_message = "Entity ID required for update"
+                        else:
+                            result = await client.update(entity_set, entity_id, fields)
+                    elif operation == "delete":
+                        if not entity_id:
+                            error_message = "Entity ID required for delete"
+                        else:
+                            result = await client.delete(entity_set, entity_id)
+                    else:
+                        error_message = f"Unknown write operation: {operation}"
+
+                    if not error_message:
+                        # Run output guards
+                        result = run_output_guards(result, operation)
+                        tool_calls.append({
+                            "type": f"odata.{operation}",
+                            "service_id": service_id,
+                            "entity_set": entity_set,
+                            "success": True,
+                        })
+                        summary = f"Successfully {operation}d entity in **{entity_set}** ({service_id})."
+                        if operation == "create" and isinstance(result, dict):
+                            summary += f" New entity created: {result}"
+                        return {
+                            "run_id": run_id,
+                            "session_id": session_id,
+                            "user_query": user_query,
+                            "user_role": user_role,
+                            "summary": summary,
+                            "plan": plan,
+                            "discovery": discovery,
+                            "tool_calls": tool_calls,
+                            "blocked_steps": [],
+                            "table": None,
+                            "primary_url": None,
+                            "primary_service": service_id,
+                            "error": None,
+                            "memory_used": memory,
+                            "llm_provider": llm_provider,
+                            "llm_latency_ms": llm_latency_ms,
+                            "llm_tokens": llm_tokens,
+                        }
+            except Exception as e:
+                logger.exception(f"Write operation failed: {e}")
+                error_message = f"Write operation failed: {e}"
+
         for idx, step in enumerate(plan.get("steps", [])):
             sid = step.get("service_id")
             ent = step.get("entity_set")
@@ -327,6 +458,12 @@ class Orchestrator:
             summary = "All proposed steps were blocked by policy: " + "; ".join(s["reason"] for s in blocked_steps)
         elif error_message and not execution_results:
             summary = error_message
+        elif primary_table is not None and primary_table.get("row_count", 0) == 0:
+            entity_name = plan.get("steps", [{}])[0].get("entity_set", "") if plan.get("steps") else ""
+            if re.search(r'(VH|StdVH|ValueHelp|Value_Help)$', entity_name):
+                summary = f"Entity **{entity_name}** is a Value Help (dropdown metadata) and contains no data. Try querying a main data entity instead (e.g., production orders, confirmations, materials)."
+            else:
+                summary = f"No data found in **{entity_name}**. The entity may be empty or the SAP endpoint may have timed out. Try a different entity or add a filter."
         elif primary_table is None:
             summary = plan.get("summary", "Done.")
         else:
@@ -352,6 +489,35 @@ class Orchestrator:
         # Apply column filter to remove useless columns
         if primary_table and primary_table.get("rows"):
             original_cols = len(primary_table.get("columns", []))
+            # Build smart column view using priority map
+            try:
+                from app.services.column_priority import get_top_columns
+                entity_name = plan.get("steps", [{}])[0].get("entity_set", "") if plan.get("steps") else ""
+                all_cols = primary_table.get("all_columns", primary_table.get("columns", []))
+                svc_id = primary_service or ""
+                # Get metadata XML from service data or fetch from client
+                svc_data = service_manager._services.get(svc_id, {})
+                metadata_xml = svc_data.get("metadata_xml", "")
+                if not metadata_xml and svc_id in service_manager._clients:
+                    client = service_manager._clients[svc_id]
+                    metadata_xml = getattr(client, "metadata_xml", "")
+                smart_cols = get_top_columns(
+                    entity_set_name=entity_name,
+                    service_id=svc_id,
+                    all_fields=all_cols,
+                    metadata_xml=metadata_xml,
+                    max_columns=20,
+                )
+                if smart_cols and len(smart_cols) < len(all_cols):
+                    smart_rows = [{k: row.get(k, "") for k in smart_cols} for row in (primary_table.get("all_rows") or primary_table.get("rows", []))]
+                    primary_table["smart_columns"] = smart_cols
+                    primary_table["smart_rows"] = smart_rows
+                else:
+                    primary_table["smart_columns"] = all_cols
+                    primary_table["smart_rows"] = primary_table.get("all_rows") or primary_table.get("rows", [])
+            except Exception as e:
+                logger.debug(f"Smart column generation failed: {e}")
+
             primary_table = filter_columns(primary_table)
             filtered_cols = len(primary_table.get("columns", []))
             if original_cols != filtered_cols:

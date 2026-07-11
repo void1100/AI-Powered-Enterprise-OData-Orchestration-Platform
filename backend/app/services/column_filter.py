@@ -1,45 +1,111 @@
-"""Post-fetch column filtering — removes useless columns from query results."""
+"""Post-fetch column filtering.
+
+The default view should reduce noise without hiding business-critical SAP
+fields. SAP services often return sparse or constant values in small result
+sets, so the filter is intentionally conservative for low row counts.
+"""
 import re
 from typing import Any, Dict, List, Set
 
 
-# SAP internal fields that are never useful
 SAP_BLACKLIST_PATTERNS = [
     r"InternalNumber$",
     r"^ProdCharc\d",
     r"ConfigurableProd",
     r"CrossPlantConfigurable",
     r"ProdCharc\dInternal",
+    r"^__",
+    r"@odata",
+    r"etag$",
 ]
 
+BUSINESS_KEEP_PATTERNS = [
+    r"order",
+    r"manufacturingorder",
+    r"purchaseorder",
+    r"salesorder",
+    r"operation",
+    r"material",
+    r"plant",
+    r"companycode",
+    r"supplier",
+    r"customer",
+    r"workcenter",
+    r"status",
+    r"release",
+    r"currency",
+    r"date",
+    r"time",
+    r"quantity",
+    r"amount",
+    r"price",
+    r"cost",
+    r"batch",
+    r"storagelocation",
+    r"purchasinggroup",
+    r"purchasingorganization",
+    r"description",
+    r"text$",
+    r"name$",
+]
 
-def is_useless_column(col_name: str, rows: List[Dict[str, Any]], threshold: float = 0.95) -> bool:
-    """Return True if a column is useless (empty, zero, or same value in >95% of rows)."""
+EMPTY_OR_DEFAULT_VALUES = {
+    "",
+    "0",
+    "0.0",
+    "0.00",
+    "000000000000000000000000000000",
+    "1970-01-01T00:00:00.000",
+}
+
+SMALL_RESULT_ROW_COUNT = 20
+
+
+def is_sap_blacklisted(col_name: str) -> bool:
+    """Return True if column matches SAP internal field patterns."""
+    return any(re.search(pattern, col_name, re.IGNORECASE) for pattern in SAP_BLACKLIST_PATTERNS)
+
+
+def is_business_column(col_name: str, column_labels: Dict[str, str] = None) -> bool:
+    """Return True for fields likely to matter to business users."""
+    label = (column_labels or {}).get(col_name, "")
+    haystack = f"{col_name} {label}".lower().replace("_", "")
+    return any(re.search(pattern, haystack, re.IGNORECASE) for pattern in BUSINESS_KEEP_PATTERNS)
+
+
+def is_useless_column(col_name: str, rows: List[Dict[str, Any]], threshold: float = 0.95, small_result: bool = False) -> bool:
+    """Return True if a column is empty/default or same value in most rows.
+    For small results, only hide truly empty columns (not constant-value ones)."""
     if not rows:
         return False
 
     total = len(rows)
     values = [str(row.get(col_name, "")).strip() for row in rows]
 
-    # Check if all values are the same
-    unique = set(values)
-    if len(unique) <= 1:
-        return True
-
-    # Check if >threshold values are empty or zero
-    empty_count = sum(1 for v in values if v in ("", "0", "0.0", "0.00", "000000000000000000000000000000", "1970-01-01T00:00:00.000"))
+    empty_count = sum(1 for v in values if v in EMPTY_OR_DEFAULT_VALUES)
     if empty_count / total >= threshold:
         return True
 
+    if not small_result and len(set(values)) <= 1:
+        return True
+
     return False
 
 
-def is_sap_blacklisted(col_name: str) -> bool:
-    """Return True if column matches SAP internal field patterns."""
-    for pattern in SAP_BLACKLIST_PATTERNS:
-        if re.search(pattern, col_name, re.IGNORECASE):
-            return True
-    return False
+def hidden_reason(col_name: str, rows: List[Dict[str, Any]]) -> str:
+    if is_sap_blacklisted(col_name):
+        return "technical/internal field"
+    if not rows:
+        return "filtered"
+
+    values = [str(row.get(col_name, "")).strip() for row in rows]
+    if len(set(values)) <= 1:
+        return "same value in result set"
+
+    empty_count = sum(1 for v in values if v in EMPTY_OR_DEFAULT_VALUES)
+    if empty_count / len(rows) >= 0.95:
+        return "mostly empty/default values"
+    return "filtered"
 
 
 def filter_columns(
@@ -47,44 +113,43 @@ def filter_columns(
     user_hidden: Set[str] = None,
     keep_hints: List[str] = None,
 ) -> Dict[str, Any]:
-    """Filter a table dict, removing useless columns.
+    """Filter a table while preserving business-relevant columns.
 
-    Args:
-        table: {"columns": [...], "rows": [...], "row_count": N}
-        user_hidden: Columns the user manually hid via column picker
-        keep_hints: Column name substrings that should NEVER be hidden
-            (e.g., ["Material", "MaterialType", "Material_Text"])
+    Returns filtered data plus full data and hidden-column metadata so the
+    frontend can offer Business View / All Columns behavior.
     """
     if not table or not table.get("rows"):
         return table
 
     columns = list(table.get("columns", []))
     rows = table["rows"]
-    keep_hints = keep_hints or []
+    column_labels = table.get("column_labels") or {}
     user_hidden = user_hidden or set()
+    keep_hints = keep_hints or []
+    small_result = len(rows) < SMALL_RESULT_ROW_COUNT
 
-    # Determine which columns to keep
     keep_cols = []
+    hidden_columns = []
+
     for col in columns:
-        # User explicitly hid this column
         if col in user_hidden:
+            hidden_columns.append({"name": col, "reason": "hidden by user"})
             continue
-        # SAP blacklisted
         if is_sap_blacklisted(col):
+            hidden_columns.append({"name": col, "reason": "technical/internal field"})
             continue
-        # Useless (all empty/zero/same)
-        if is_useless_column(col, rows):
+        if col in keep_hints or is_business_column(col, column_labels):
+            keep_cols.append(col)
+            continue
+        if not small_result and is_useless_column(col, rows, small_result=small_result):
+            hidden_columns.append({"name": col, "reason": hidden_reason(col, rows)})
             continue
         keep_cols.append(col)
 
-    # If we filtered everything, keep at least the first 3 columns
     if not keep_cols:
-        keep_cols = columns[:3]
+        keep_cols = [c for c in columns if not is_sap_blacklisted(c)][:8] or columns[:3]
 
-    # Build filtered rows
-    filtered_rows = []
-    for row in rows:
-        filtered_rows.append({k: row.get(k, "") for k in keep_cols})
+    filtered_rows = [{k: row.get(k, "") for k in keep_cols} for row in rows]
 
     return {
         "columns": keep_cols,
@@ -92,4 +157,16 @@ def filter_columns(
         "row_count": len(filtered_rows),
         "truncated": table.get("truncated", False),
         "total_count": table.get("total_count"),
+        "all_columns": columns,
+        "all_rows": rows,
+        "column_labels": column_labels or None,
+        "hidden_columns": hidden_columns,
+        "smart_columns": table.get("smart_columns"),
+        "smart_rows": table.get("smart_rows"),
+        "filter_mode": "business_safe",
+        "filter_note": (
+            "Small result set: business columns are preserved; only technical columns are hidden."
+            if small_result
+            else "Business-safe filter applied; technical/noisy columns hidden."
+        ),
     }
