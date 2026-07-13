@@ -101,6 +101,7 @@ class ChatResponse(BaseModel):
     intent: Optional[str] = None
     auto_train_result: Optional[Dict[str, Any]] = None
     write_preview: Optional[Dict[str, Any]] = None
+    clarification: Optional[Dict[str, Any]] = None
 
 
 class SessionCreate(BaseModel):

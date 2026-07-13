@@ -146,7 +146,9 @@ function renderMessages(msgs) {
     if (m.role === "user") {
       addUserBubble(m.content, false);
     } else if (m.role === "assistant") {
-      addAssistantBubble(m.content, m.result, false);
+      const result = m.result || {};
+      if (m.plan && !result.plan) result.plan = m.plan;
+      addAssistantBubble(m.content, result, false);
     }
   });
   messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -160,11 +162,105 @@ function addUserBubble(text, scroll = true) {
   if (scroll) messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
+function describePlanStep(step, index) {
+  if (!step) return `Step ${index + 1}`;
+  const service = step.service_id || "service";
+  const entity = step.entity_set || "entity";
+  const select = Array.isArray(step.select) && step.select.length ? `, columns: ${step.select.join(", ")}` : "";
+  const top = step.top != null ? `, top ${step.top}` : "";
+  const filter = step.filter ? `, filter: ${step.filter}` : "";
+  const orderby = step.orderby ? `, order by: ${step.orderby}` : "";
+  return `${service}/${entity}${select}${top}${filter}${orderby}`;
+}
+
+function buildExtractionTrace(result = {}, state = "complete") {
+  const panel = document.createElement("div");
+  panel.className = `process-window process-${state}`;
+
+  const plan = result.plan || {};
+  const steps = Array.isArray(plan.steps) ? plan.steps : [];
+  const toolCalls = Array.isArray(result.tool_calls) ? result.tool_calls : [];
+  const queryCalls = toolCalls.filter((t) => t.type === "odata.query");
+  const rows = result.table && Array.isArray(result.table.rows) ? result.table.rows.length : null;
+  const cols = result.table && Array.isArray(result.table.columns) ? result.table.columns.length : null;
+  const provider = result.llm?.provider || result.llm_provider || "pending";
+  const latency = result.llm?.latency_ms ?? result.llm_latency_ms;
+  const tokens = result.llm?.tokens ?? result.llm_tokens;
+
+  const items = [];
+  if (state === "running") {
+    items.push(["active", "Receive question", "The browser sent your natural-language request to the backend."]);
+    items.push(["pending", "Recover service context", "Backend checks registered OData services and entity metadata."]);
+    items.push(["pending", "Create query plan", "Reasoning engine chooses service, entity, columns, filters, and row limit."]);
+    items.push(["pending", "Execute OData request", "Validated query is sent to the selected OData endpoint."]);
+    items.push(["pending", "Shape result table", "Response rows are cleaned and prepared for display."]);
+  } else {
+    items.push(["done", "Receive question", "Saved in the current chat session."]);
+    items.push(["done", "Create query plan", steps.length ? steps.map(describePlanStep).join("; ") : `Intent: ${plan.intent || result.llm?.intent || "unknown"}`]);
+    if (queryCalls.length) {
+      queryCalls.forEach((call) => {
+        const corrected = call.corrected ? " Self-corrected after retry." : "";
+        items.push(["done", "Execute OData request", `${call.service_id}/${call.entity_set} returned ${call.row_count ?? 0} rows.${corrected}`]);
+      });
+    } else if (toolCalls.length) {
+      items.push(["done", "Run backend tool", toolCalls.map((t) => t.type || "tool").join(", ")]);
+    } else {
+      items.push(["done", "Execute backend flow", "No OData query call was needed for this response."]);
+    }
+    items.push(["done", "Shape result table", rows != null ? `${rows} rows and ${cols || 0} columns prepared for the UI.` : "No table was returned."]);
+  }
+
+  const headerMeta = [
+    `Provider: ${provider}`,
+    latency != null ? `Latency: ${latency}ms` : "",
+    tokens ? `Tokens: ${tokens}` : "",
+  ].filter(Boolean).join(" | ");
+
+  panel.innerHTML = `
+    <div class="process-header">
+      <span>Extraction Process</span>
+      <span>${escapeHtml(headerMeta)}</span>
+    </div>
+    <ol class="process-steps">
+      ${items.map(([status, title, detail]) => `
+        <li class="process-step ${status}">
+          <span class="process-dot"></span>
+          <div>
+            <div class="process-title">${escapeHtml(title)}</div>
+            <div class="process-detail">${escapeHtml(detail)}</div>
+          </div>
+        </li>
+      `).join("")}
+    </ol>
+  `;
+
+  if (state === "complete" && queryCalls.length) {
+    const urlWrap = document.createElement("details");
+    urlWrap.className = "process-urls";
+    urlWrap.innerHTML = `<summary>OData request URL${queryCalls.length > 1 ? "s" : ""}</summary>` +
+      queryCalls.map((call) => `<div class="url-line">${escapeHtml(call.url || "")}</div>`).join("");
+    panel.appendChild(urlWrap);
+  }
+
+  return panel;
+}
+
 function addAssistantBubble(summary, result, scroll = true, paginationInfo = null) {
   const div = document.createElement("div");
   div.className = "bubble assistant";
   div.innerHTML = renderMarkdown(summary || "Done.");
   try {
+  if (result && (result.plan || result.tool_calls || result.table || result.llm)) {
+    div.appendChild(buildExtractionTrace(result, "complete"));
+  }
+  if (result && (result.clarification || (result.tool_calls || []).some((t) => t.type === "entity_clarification" && t.candidates))) {
+    const clarifyTool = (result.tool_calls || []).find((t) => t.type === "entity_clarification" && t.candidates);
+    div.appendChild(renderClarification(result.clarification || {
+      type: "entity_choice",
+      query: "",
+      candidates: clarifyTool.candidates || [],
+    }));
+  }
   if (result && result.llm) {
     const badge = document.createElement("div");
     badge.className = `llm-badge llm-${result.llm.provider}`;
@@ -1737,10 +1833,47 @@ themeObserver.observe(document.documentElement, { attributes: true, attributeFil
 function addProcessingBubble(text) {
   const div = document.createElement("div");
   div.className = "bubble assistant processing-bubble";
-  div.innerHTML = `<span class="processing-text">${escapeHtml(text)}</span><span class="typing-dots"><span></span><span></span><span></span></span>`;
+  const label = document.createElement("div");
+  label.className = "processing-line";
+  label.innerHTML = `<span class="processing-text">${escapeHtml(text)}</span><span class="typing-dots"><span></span><span></span><span></span></span>`;
+  div.appendChild(label);
+  div.appendChild(buildExtractionTrace({}, "running"));
   messagesEl.appendChild(div);
   messagesEl.scrollTop = messagesEl.scrollHeight;
   return div;
+}
+
+function renderClarification(clarification) {
+  const wrap = document.createElement("div");
+  wrap.className = "clarification-panel";
+  const candidates = clarification.candidates || [];
+  wrap.innerHTML = `<div class="section-label">Possible Entities</div>`;
+  candidates.forEach((candidate) => {
+    const item = document.createElement("div");
+    item.className = "clarification-item";
+    const label = candidate.entity_label ? ` · ${candidate.entity_label}` : "";
+    const props = (candidate.properties || []).slice(0, 6).join(", ");
+    item.innerHTML = `
+      <div class="clarification-main">
+        <strong>${escapeHtml(candidate.entity_set || "")}</strong>
+        <span>${escapeHtml(candidate.service_name || candidate.service_id || "")}${escapeHtml(label)}</span>
+        ${props ? `<small>${escapeHtml(props)}</small>` : ""}
+      </div>
+      <div class="clarification-actions">
+        <button class="clarify-use" type="button">Thumbs up</button>
+        <button class="clarify-reject" type="button">Thumbs down</button>
+      </div>
+    `;
+    item.querySelector(".clarify-use").addEventListener("click", () => {
+      queryInput.value = `show ${candidate.entity_set}`;
+      send();
+    });
+    item.querySelector(".clarify-reject").addEventListener("click", () => {
+      item.classList.add("rejected");
+    });
+    wrap.appendChild(item);
+  });
+  return wrap;
 }
 
 function removeProcessingBubble() {
@@ -1808,7 +1941,14 @@ async function send() {
         } else {
           addAssistantBubble(resp.summary, {
             table: resp.table,
+            plan: resp.plan,
             tool_calls: resp.tool_calls,
+            primary_url: resp.primary_url,
+            primary_service: resp.primary_service,
+            chart_recommendations: resp.chart_recommendations,
+            drill_down_links: resp.drill_down_links,
+            auto_train_result: resp.auto_train_result,
+            clarification: resp.clarification,
             llm: {
               provider: resp.llm_provider,
               latency_ms: resp.llm_latency_ms,
@@ -1835,7 +1975,14 @@ async function send() {
       lastTable = resp.table;
       addAssistantBubble(resp.summary, {
         table: resp.table,
+        plan: resp.plan,
         tool_calls: resp.tool_calls,
+        primary_url: resp.primary_url,
+        primary_service: resp.primary_service,
+        chart_recommendations: resp.chart_recommendations,
+        drill_down_links: resp.drill_down_links,
+        auto_train_result: resp.auto_train_result,
+        clarification: resp.clarification,
         llm: {
           provider: resp.llm_provider,
           latency_ms: resp.llm_latency_ms,

@@ -51,11 +51,27 @@ BUSINESS_KEEP_PATTERNS = [
 
 EMPTY_OR_DEFAULT_VALUES = {
     "",
+    "None",
+    "none",
+    "NULL",
+    "null",
+    "NaN",
+    "nan",
     "0",
     "0.0",
     "0.00",
     "000000000000000000000000000000",
     "1970-01-01T00:00:00.000",
+}
+
+EMPTY_VALUES = {
+    "",
+    "None",
+    "none",
+    "NULL",
+    "null",
+    "NaN",
+    "nan",
 }
 
 SMALL_RESULT_ROW_COUNT = 20
@@ -92,6 +108,14 @@ def is_useless_column(col_name: str, rows: List[Dict[str, Any]], threshold: floa
     return False
 
 
+def is_empty_column(col_name: str, rows: List[Dict[str, Any]]) -> bool:
+    """Return True when every returned row is blank/null for this column."""
+    if not rows:
+        return False
+    values = [str(row.get(col_name, "")).strip() for row in rows]
+    return all(v in EMPTY_VALUES for v in values)
+
+
 def hidden_reason(col_name: str, rows: List[Dict[str, Any]]) -> str:
     if is_sap_blacklisted(col_name):
         return "technical/internal field"
@@ -99,6 +123,8 @@ def hidden_reason(col_name: str, rows: List[Dict[str, Any]]) -> str:
         return "filtered"
 
     values = [str(row.get(col_name, "")).strip() for row in rows]
+    if all(v in EMPTY_VALUES for v in values):
+        return "empty/null in result set"
     if len(set(values)) <= 1:
         return "same value in result set"
 
@@ -138,6 +164,9 @@ def filter_columns(
         if is_sap_blacklisted(col):
             hidden_columns.append({"name": col, "reason": "technical/internal field"})
             continue
+        if is_empty_column(col, rows):
+            hidden_columns.append({"name": col, "reason": "empty/null in result set"})
+            continue
         if col in keep_hints or is_business_column(col, column_labels):
             keep_cols.append(col)
             continue
@@ -150,6 +179,12 @@ def filter_columns(
         keep_cols = [c for c in columns if not is_sap_blacklisted(c)][:8] or columns[:3]
 
     filtered_rows = [{k: row.get(k, "") for k in keep_cols} for row in rows]
+    hidden_names = {c["name"] for c in hidden_columns}
+    smart_columns = [c for c in (table.get("smart_columns") or []) if c not in hidden_names]
+    smart_rows = None
+    if smart_columns:
+        smart_source_rows = table.get("smart_rows") or rows
+        smart_rows = [{k: row.get(k, "") for k in smart_columns} for row in smart_source_rows]
 
     return {
         "columns": keep_cols,
@@ -161,8 +196,8 @@ def filter_columns(
         "all_rows": rows,
         "column_labels": column_labels or None,
         "hidden_columns": hidden_columns,
-        "smart_columns": table.get("smart_columns"),
-        "smart_rows": table.get("smart_rows"),
+        "smart_columns": smart_columns or None,
+        "smart_rows": smart_rows,
         "filter_mode": "business_safe",
         "filter_note": (
             "Small result set: business columns are preserved; only technical columns are hidden."

@@ -903,6 +903,7 @@ LLM_CATALOG = [
     {"id": "groq-mixtral-8x7b", "provider": "openai", "label": "Groq: Mixtral 8x7B (32k ctx)", "model": "mixtral-8x7b-32768", "requires": ["openai_key", "groq_base_url"]},
     {"id": "gemini-flash", "provider": "gemini", "label": "Gemini: Flash (latest)", "model": "gemini-flash-latest", "requires": ["gemini_key"]},
     {"id": "gemini-2.0-flash", "provider": "gemini", "label": "Gemini: 2.0 Flash", "model": "gemini-2.0-flash", "requires": ["gemini_key"]},
+    {"id": "openrouter-minimax-m3", "provider": "openrouter", "label": "OpenRouter: MiniMax M3", "model": "minimax/minimax-m3", "requires": ["openrouter_key"]},
     {"id": "openrouter-deepseek-r1", "provider": "openrouter", "label": "OpenRouter: DeepSeek R1 (best reasoning)", "model": "deepseek/deepseek-r1", "requires": ["openrouter_key"]},
     {"id": "openrouter-claude-3.5-sonnet", "provider": "openrouter", "label": "OpenRouter: Claude 3.5 Sonnet", "model": "anthropic/claude-3.5-sonnet", "requires": ["openrouter_key"]},
     {"id": "openrouter-gpt-4o", "provider": "openrouter", "label": "OpenRouter: GPT-4o", "model": "openai/gpt-4o", "requires": ["openrouter_key"]},
@@ -1128,7 +1129,6 @@ async def chat(payload: ChatRequest, request: Request):
             best_model = models[0]
 
         # Extract feature values from query (enhanced patterns)
-        import re
         features = {}
         for feat in best_model.get("feature_columns", []):
             feat_esc = re.escape(feat)
@@ -1292,12 +1292,12 @@ async def chat(payload: ChatRequest, request: Request):
                 for join_def in sorted_joins:
                     lk = join_def.get("left_key", "")
                     rk = join_def.get("right_key", "")
-                    re = join_def.get("right_entity", "")
+                    right_entity_name = join_def.get("right_entity", "")
                     if not lk or not rk:
                         continue
                     right_result = None
                     for r in all_results:
-                        if r["entity_name"] == re and r["entity_name"] not in used_right:
+                        if r["entity_name"] == right_entity_name and r["entity_name"] not in used_right:
                             right_result = r["table"]
                             used_right.add(r["entity_name"])
                             break
@@ -1477,13 +1477,25 @@ async def chat(payload: ChatRequest, request: Request):
 
     services_list = service_manager.list_services()
     q_lower = payload.query.lower()
+    q_compact = re.sub(r"[^a-z0-9]", "", q_lower)
+    exact_entity_requested = any(
+        (
+            es.lower() in q_lower
+            or es.lower().replace("_", " ") in q_lower
+            or re.sub(r"[^a-z0-9]", "", es.lower()) in q_compact
+        )
+        for svc in services_list
+        for es in svc.get("entity_sets", [])
+    )
+    aggregate_keywords = (" by ", " per ", "count", "total", "sum", "average", "avg", "join", "combine", "compare")
+    should_try_multi_entity = (not exact_entity_requested) and any(k in f" {q_lower} " for k in aggregate_keywords)
     explicit_service = None
     for svc in services_list:
         if svc["id"].lower() in q_lower or svc["name"].lower() in q_lower:
             explicit_service = svc["id"]
             break
     # Always try multi-entity aggregation — scope to explicit service if mentioned
-    services_to_check = [s for s in services_list if not explicit_service or s["id"] == explicit_service]
+    services_to_check = [s for s in services_list if should_try_multi_entity and (not explicit_service or s["id"] == explicit_service)]
     for svc in services_to_check:
         svc_id = svc["id"]
         client = service_manager.get_client(svc_id)
@@ -1495,7 +1507,7 @@ async def chat(payload: ChatRequest, request: Request):
             if any(vp in es_lower for vp in ("summary", "by_", "for_", "list_of", "extended", "subtotal", "quarterly", "annual")):
                 continue
             try:
-                raw = await client.query(entity_set=es, top=1)
+                raw = await asyncio.wait_for(client.query(entity_set=es, top=1), timeout=3.0)
                 flat = client.flatten_odata_value(raw)
                 if flat:
                     entity_cols[es] = [c for c in flat[0].keys() if not c.startswith("@odata")]
@@ -1540,8 +1552,65 @@ async def chat(payload: ChatRequest, request: Request):
                         chart_recommendations=me_chart_recs,
                     )
 
+    candidates = llm_engine.find_entity_candidates(services_list, payload.query, limit=5)
+    if not exact_entity_requested and len(candidates) >= 2:
+        top_score = candidates[0].get("score", 0)
+        close_candidates = [
+            c for c in candidates
+            if top_score and c.get("score", 0) >= top_score * 0.7
+        ][:3]
+        if len(close_candidates) >= 2:
+            candidate_lines = [
+                f"- {c.get('entity_set', '')} ({c.get('service_name') or c.get('service_id', 'service')})"
+                for c in close_candidates
+            ]
+            summary = (
+                "I found multiple possible entities for your request. Choose the one that matches what you mean."
+                "\n\n" + "\n".join(candidate_lines)
+            )
+            clarification = {
+                "type": "entity_choice",
+                "query": payload.query,
+                "candidates": close_candidates,
+            }
+            tool_calls_clarify = [{"type": "entity_clarification", "candidate_count": len(close_candidates), "candidates": close_candidates}]
+            add_message(
+                session_id,
+                "assistant",
+                summary,
+                plan={"intent": "clarify", "summary": summary},
+                result={"tool_calls": tool_calls_clarify, "clarification": clarification},
+            )
+            return ChatResponse(
+                run_id=str(uuid.uuid4()),
+                session_id=session_id,
+                user_query=payload.query,
+                user_role=user_role,
+                summary=summary,
+                plan={"intent": "clarify", "summary": summary},
+                discovery=None,
+                tool_calls=tool_calls_clarify,
+                blocked_steps=[],
+                table=None,
+                primary_url=None,
+                primary_service=None,
+                error=None,
+                memory_used=[],
+                llm_provider="entity-candidates",
+                llm_latency_ms=0,
+                llm_tokens=0,
+                clarification=clarification,
+            )
+
+    orchestrator_query = payload.query
+    if not exact_entity_requested and candidates:
+        top = candidates[0]
+        second_score = candidates[1].get("score", 0) if len(candidates) > 1 else 0
+        if top.get("score", 0) >= 1.2 and (not second_score or top.get("score", 0) >= second_score * 1.6):
+            orchestrator_query = f"show {top['entity_set']}"
+
     result = await orchestrator.run(
-        user_query=payload.query,
+        user_query=orchestrator_query,
         session_id=session_id,
         user_role=user_role,
     )
@@ -1685,7 +1754,8 @@ async def chat(payload: ChatRequest, request: Request):
             "chart_recommendations": chart_recs,
             "drill_down_links": drill_links,
         }
-        query_cache.set(payload.query, response_data, session_id)
+        if has_table and not result.get("error"):
+            query_cache.set(payload.query, response_data, session_id)
     except Exception:
         pass
 

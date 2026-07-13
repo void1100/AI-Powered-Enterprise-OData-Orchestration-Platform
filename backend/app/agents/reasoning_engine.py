@@ -80,6 +80,11 @@ class LLMReasoningEngine:
     def get_config(self) -> Dict[str, Any]:
         return {"provider": self.provider, "model": self.model}
 
+    def _normalize_query_typos(self, query: str) -> str:
+        """Normalize common business-term typos before planning."""
+        normalized = re.sub(r"\bchat\s+of\s+accounts\b", "chart of accounts", query, flags=re.IGNORECASE)
+        return normalized
+
     def _detect_explicit_service(self, services: List[Dict[str, Any]], query: str) -> Optional[str]:
         """Detect if user explicitly names a service via 'from X' or just mentions the service name.
         Returns service_id if matched, None otherwise."""
@@ -114,6 +119,134 @@ class LLMReasoningEngine:
                 return svc["id"]
 
         return None
+
+    def _detect_exact_entity(self, services: List[Dict[str, Any]], query: str) -> Optional[Tuple[str, str]]:
+        """Return (service_id, entity_set) when the query contains an exact entity set name."""
+        q = query.lower()
+        q_compact = re.sub(r"[^a-z0-9]", "", q)
+        matches: List[Tuple[int, str, str]] = []
+
+        def entity_search_forms(entity_name: str) -> List[str]:
+            forms = {entity_name.lower()}
+            no_prefix = re.sub(r"^[aci]_", "", entity_name, flags=re.IGNORECASE)
+            spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", no_prefix)
+            spaced = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", spaced)
+            spaced = spaced.replace("_", " ").replace("-", " ").replace(".", " ")
+            spaced = re.sub(r"\s+", " ", spaced).strip().lower()
+            if spaced:
+                forms.add(spaced)
+                forms.add(spaced.replace(" ", ""))
+            forms.add(no_prefix.lower())
+            forms.add(no_prefix.lower().replace("_", " "))
+            return [f for f in forms if f]
+
+        for svc in services:
+            for entity in svc.get("entity_sets", []):
+                entity_lower = entity.lower()
+                entity_compact = re.sub(r"[^a-z0-9]", "", entity_lower)
+                if not entity_compact:
+                    continue
+                forms = entity_search_forms(entity)
+                compact_forms = [re.sub(r"[^a-z0-9]", "", f) for f in forms]
+                if any(f in q for f in forms) or any(cf and cf in q_compact for cf in compact_forms):
+                    matches.append((len(entity_compact), svc["id"], entity))
+        if not matches:
+            return None
+        matches.sort(reverse=True)
+        _, service_id, entity_set = matches[0]
+        return service_id, entity_set
+
+    def find_entity_candidates(
+        self,
+        services: List[Dict[str, Any]],
+        query: str,
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Rank entity candidates from user words without hardcoded domain routes."""
+        q = self._normalize_query_typos(query).lower()
+        stop_words = {
+            "show", "get", "list", "display", "fetch", "find", "all", "the", "a", "an",
+            "of", "for", "from", "with", "by", "top", "first", "please", "me",
+        }
+        q_words = set(re.findall(r"[a-z0-9]{2,}", q)) - stop_words
+        q_phrase = " ".join(w for w in re.findall(r"[a-z0-9]{2,}", q) if w not in stop_words)
+
+        def split_entity(name: str) -> List[str]:
+            no_prefix = re.sub(r"^[aci]_", "", name, flags=re.IGNORECASE)
+            spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", no_prefix)
+            spaced = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", spaced)
+            spaced = spaced.replace("_", " ").replace("-", " ").replace(".", " ")
+            return re.findall(r"[a-z0-9]{2,}", spaced.lower())
+
+        candidates: List[Dict[str, Any]] = []
+        for svc in services:
+            labels = svc.get("entity_labels", {})
+            props_by_entity = svc.get("entity_properties", {})
+            for entity in svc.get("entity_sets", []):
+                words = split_entity(entity)
+                if not words:
+                    continue
+                word_set = set(words)
+                overlap = q_words & word_set
+                entity_phrase = " ".join(words)
+                compact_entity = "".join(words)
+                compact_query = re.sub(r"[^a-z0-9]", "", q)
+                score = 0.0
+                if overlap:
+                    score += len(overlap) / max(len(q_words), 1)
+                    score += len(overlap) / len(word_set)
+                if q_phrase and (q_phrase in entity_phrase or entity_phrase in q_phrase):
+                    score += 1.5
+                if compact_entity and compact_entity in compact_query:
+                    score += 2.0
+                label = labels.get(entity, {}).get("entity_label", "")
+                if label:
+                    label_words = set(re.findall(r"[a-z0-9]{2,}", label.lower()))
+                    label_overlap = q_words & label_words
+                    if label_overlap:
+                        score += len(label_overlap) / max(len(q_words), 1)
+                if score <= 0:
+                    continue
+                candidates.append({
+                    "service_id": svc["id"],
+                    "service_name": svc.get("name", svc["id"]),
+                    "entity_set": entity,
+                    "entity_label": label,
+                    "score": round(score, 4),
+                    "properties": props_by_entity.get(entity, [])[:12],
+                })
+
+        candidates.sort(key=lambda c: (-c["score"], c["service_id"], c["entity_set"]))
+        return candidates[:limit]
+
+    def _build_candidate_plan(self, query: str, candidate: Dict[str, Any], memory_context: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        entity_set = candidate["entity_set"]
+        service_id = candidate["service_id"]
+        select, expand, filter_expr, orderby, top = self._build_query_parts(
+            query.lower(),
+            entity_set,
+            [],
+            service_id=service_id,
+            metadata_xml="",
+        )
+        if top is None:
+            top = 20
+        return {
+            "intent": self._infer_intent(query.lower()),
+            "target_services": [service_id],
+            "steps": [{
+                "service_id": service_id,
+                "entity_set": entity_set,
+                "select": select,
+                "filter": filter_expr,
+                "expand": expand,
+                "top": top,
+                "skip": 0,
+                "orderby": orderby,
+            }],
+            "summary": f"Showing data from {entity_set}.",
+            "memory_used": memory_context or [],
+        }
 
     def _truncate_service_for_llm(self, svc: Dict[str, Any], max_entities: int = 15, max_props_per_entity: int = 8) -> Dict[str, Any]:
         """Truncate service data to fit within LLM token limits.
@@ -153,6 +286,43 @@ class LLMReasoningEngine:
         available_services: List[Dict[str, Any]],
         memory_context: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        query = self._normalize_query_typos(query)
+        exact_entity = self._detect_exact_entity(available_services, query)
+        if exact_entity:
+            service_id, entity_set = exact_entity
+            svc = next((s for s in available_services if s["id"] == service_id), None)
+            metadata_xml = svc.get("metadata_xml", "") if svc else ""
+            select, expand, filter_expr, orderby, top = self._build_query_parts(
+                query.lower(),
+                entity_set,
+                [],
+                service_id=service_id,
+                metadata_xml=metadata_xml,
+            )
+            if top is None:
+                top = 20
+            plan = {
+                "intent": self._infer_intent(query.lower()),
+                "target_services": [service_id],
+                "steps": [{
+                    "service_id": service_id,
+                    "entity_set": entity_set,
+                    "select": select,
+                    "filter": filter_expr,
+                    "expand": expand,
+                    "top": top,
+                    "skip": 0,
+                    "orderby": orderby,
+                }],
+                "summary": f"Showing data from {entity_set}.",
+                "memory_used": memory_context or [],
+            }
+            plan = self.optimizer.optimize_plan(plan, query)
+            self.optimizer.cache_plan(query, [service_id], plan)
+            self.optimizer._stats["llm_skipped"] += 1
+            logger.info(f"Exact entity detected: {service_id}/{entity_set}; skipping LLM")
+            return plan, {"provider": "entity-match", "latency_ms": 0, "tokens": 0, "intent": plan["intent"]}
+
         explicit_service = self._detect_explicit_service(available_services, query.lower())
         if explicit_service:
             filtered = [s for s in available_services if s["id"] == explicit_service]
@@ -847,6 +1017,7 @@ class LLMReasoningEngine:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
+            max_tokens=2048,
             response_format={"type": "json_object"},
         )
         content = resp.choices[0].message.content
@@ -893,6 +1064,7 @@ class LLMReasoningEngine:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
+            max_tokens=2048,
             response_format={"type": "json_object"},
         )
         content = resp.choices[0].message.content

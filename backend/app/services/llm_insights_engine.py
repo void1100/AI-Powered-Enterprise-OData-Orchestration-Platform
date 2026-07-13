@@ -145,6 +145,7 @@ async def _call_openrouter(system_prompt: str, user_content: str, settings) -> D
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
+        max_tokens=2048,
         response_format={"type": "json_object"},
     )
     content = resp.choices[0].message.content or "{}"

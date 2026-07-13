@@ -153,10 +153,17 @@ NVIDIA_API_KEY=nvapi-your_key_here
 # Gemini
 LLM_PROVIDER=gemini
 GEMINI_API_KEY=AIza_your_key_here
+
+# OpenRouter MiniMax M3
+LLM_PROVIDER=openrouter
+OPENROUTER_API_KEY=sk-or-your_key_here
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+LLM_MODEL=minimax/minimax-m3
 ```
 
 Free API keys:
 - Groq: https://console.groq.com/keys
+- OpenRouter: https://openrouter.ai/keys
 - NVIDIA: https://build.nvidia.com/
 - Gemini: https://aistudio.google.com/apikey
 

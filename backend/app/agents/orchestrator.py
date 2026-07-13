@@ -2,6 +2,8 @@
 execution, and memory.
 """
 import uuid
+import re
+import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from loguru import logger
@@ -501,12 +503,16 @@ class Orchestrator:
                 if not metadata_xml and svc_id in service_manager._clients:
                     client = service_manager._clients[svc_id]
                     metadata_xml = getattr(client, "metadata_xml", "")
-                smart_cols = get_top_columns(
-                    entity_set_name=entity_name,
-                    service_id=svc_id,
-                    all_fields=all_cols,
-                    metadata_xml=metadata_xml,
-                    max_columns=20,
+                smart_cols = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        get_top_columns,
+                        entity_set_name=entity_name,
+                        service_id=svc_id,
+                        all_fields=all_cols,
+                        metadata_xml=metadata_xml,
+                        max_columns=20,
+                    ),
+                    timeout=2.0,
                 )
                 if smart_cols and len(smart_cols) < len(all_cols):
                     smart_rows = [{k: row.get(k, "") for k in smart_cols} for row in (primary_table.get("all_rows") or primary_table.get("rows", []))]
@@ -515,6 +521,10 @@ class Orchestrator:
                 else:
                     primary_table["smart_columns"] = all_cols
                     primary_table["smart_rows"] = primary_table.get("all_rows") or primary_table.get("rows", [])
+            except asyncio.TimeoutError:
+                logger.warning("Smart column generation timed out; returning unprioritized table")
+                primary_table["smart_columns"] = primary_table.get("columns", [])
+                primary_table["smart_rows"] = primary_table.get("rows", [])
             except Exception as e:
                 logger.debug(f"Smart column generation failed: {e}")
 
