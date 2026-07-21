@@ -125,7 +125,55 @@ body { color-scheme: var(--color-scheme); }
 .sidebar-header { display: flex; justify-content: space-between; align-items: center; }
 .sidebar-header h2 { margin: 0; font-size: 16px; letter-spacing: 0.5px; color: var(--text-sidebar); }
 .sidebar-header button { background: var(--accent); color: var(--text-on-accent); border: none; border-radius: 6px; width: 28px; height: 28px; cursor: pointer; font-size: 18px; line-height: 1; }
-.session-list { list-style: none; padding: 0 4px 0 0; margin: 0; overflow-y: auto; flex: 1; min-height: 0; scrollbar-gutter: stable; }
+.session-scroll-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+.session-list {
+  list-style: none;
+  height: 100%;
+  padding: 0 18px 0 0;
+  margin: 0;
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: #64748b transparent;
+}
+.session-list::-webkit-scrollbar { width: 10px; }
+.session-list::-webkit-scrollbar-track { background: transparent; }
+.session-list::-webkit-scrollbar-thumb {
+  background: #64748b;
+  border: 2px solid var(--bg-sidebar);
+  border-radius: 999px;
+}
+.session-list::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+.session-scrollbar {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 10px;
+  border-radius: 999px;
+  background: rgba(100, 116, 139, 0.22);
+}
+.session-scrollbar-thumb {
+  position: absolute;
+  left: 2px;
+  right: 2px;
+  top: 0;
+  min-height: 36px;
+  border-radius: 999px;
+  background: #94a3b8;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+.session-scrollbar-thumb:hover,
+.session-scrollbar.dragging .session-scrollbar-thumb {
+  background: #cbd5e1;
+}
+.session-scrollbar:not(.is-scrollable) .session-scrollbar-thumb {
+  display: none;
+}
 .session-list li { padding: 10px 12px; border-radius: 8px; cursor: pointer; margin-bottom: 4px; font-size: 14px; display: flex; justify-content: space-between; align-items: center; color: var(--text-sidebar); }
 .session-list li:hover { background: var(--bg-sidebar-hover); }
 .session-list li.active { background: var(--accent); color: var(--text-on-accent); }

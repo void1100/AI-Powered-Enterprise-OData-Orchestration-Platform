@@ -19,6 +19,8 @@ let isLoading = false;
 const $ = (id) => document.getElementById(id);
 const messagesEl = $("messages");
 const sessionList = $("sessionList");
+const sessionScrollbar = $("sessionScrollbar");
+const sessionScrollbarThumb = $("sessionScrollbarThumb");
 const queryInput = $("queryInput");
 const sendBtn = $("sendBtn");
 const roleSelect = $("roleSelect");
@@ -86,9 +88,71 @@ async function loadSessions() {
       });
       sessionList.appendChild(li);
     });
+    updateSessionScrollbar();
   } catch (e) {
     console.error(e);
   }
+}
+
+function updateSessionScrollbar() {
+  if (!sessionList || !sessionScrollbar || !sessionScrollbarThumb) return;
+  const scrollable = sessionList.scrollHeight > sessionList.clientHeight + 1;
+  sessionScrollbar.classList.toggle("is-scrollable", scrollable);
+  if (!scrollable) {
+    sessionScrollbarThumb.style.height = "0px";
+    sessionScrollbarThumb.style.transform = "translateY(0)";
+    return;
+  }
+
+  const trackHeight = sessionScrollbar.clientHeight;
+  const thumbHeight = Math.max(36, Math.round((sessionList.clientHeight / sessionList.scrollHeight) * trackHeight));
+  const maxThumbTop = Math.max(0, trackHeight - thumbHeight);
+  const maxScrollTop = Math.max(1, sessionList.scrollHeight - sessionList.clientHeight);
+  const thumbTop = Math.round((sessionList.scrollTop / maxScrollTop) * maxThumbTop);
+  sessionScrollbarThumb.style.height = `${thumbHeight}px`;
+  sessionScrollbarThumb.style.transform = `translateY(${thumbTop}px)`;
+}
+
+function bindSessionScrollbar() {
+  if (!sessionList || !sessionScrollbar || !sessionScrollbarThumb) return;
+  sessionList.addEventListener("scroll", updateSessionScrollbar);
+  window.addEventListener("resize", updateSessionScrollbar);
+
+  sessionScrollbar.addEventListener("click", (e) => {
+    if (e.target === sessionScrollbarThumb) return;
+    const rect = sessionScrollbar.getBoundingClientRect();
+    const thumbHeight = sessionScrollbarThumb.offsetHeight || 36;
+    const clickTop = e.clientY - rect.top - thumbHeight / 2;
+    const maxThumbTop = Math.max(1, sessionScrollbar.clientHeight - thumbHeight);
+    const ratio = Math.max(0, Math.min(1, clickTop / maxThumbTop));
+    sessionList.scrollTop = ratio * (sessionList.scrollHeight - sessionList.clientHeight);
+  });
+
+  sessionScrollbarThumb.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    sessionScrollbar.classList.add("dragging");
+    sessionScrollbarThumb.setPointerCapture(e.pointerId);
+    const startY = e.clientY;
+    const startScrollTop = sessionList.scrollTop;
+    const thumbHeight = sessionScrollbarThumb.offsetHeight || 36;
+    const maxThumbTop = Math.max(1, sessionScrollbar.clientHeight - thumbHeight);
+    const maxScrollTop = Math.max(1, sessionList.scrollHeight - sessionList.clientHeight);
+
+    const onMove = (moveEvent) => {
+      const deltaY = moveEvent.clientY - startY;
+      sessionList.scrollTop = startScrollTop + (deltaY / maxThumbTop) * maxScrollTop;
+    };
+    const onUp = () => {
+      sessionScrollbar.classList.remove("dragging");
+      sessionScrollbarThumb.removeEventListener("pointermove", onMove);
+      sessionScrollbarThumb.removeEventListener("pointerup", onUp);
+      sessionScrollbarThumb.removeEventListener("pointercancel", onUp);
+    };
+
+    sessionScrollbarThumb.addEventListener("pointermove", onMove);
+    sessionScrollbarThumb.addEventListener("pointerup", onUp);
+    sessionScrollbarThumb.addEventListener("pointercancel", onUp);
+  });
 }
 
 function renderSessions() {
@@ -96,6 +160,7 @@ function renderSessions() {
     const id = li.querySelector(".del").dataset.id;
     li.classList.toggle("active", id === currentSessionId);
   });
+  updateSessionScrollbar();
 }
 
 function emptyStateHtml() {
@@ -1246,5 +1311,6 @@ addServiceForm.addEventListener("submit", async (e) => {
   }
 });
 
+bindSessionScrollbar();
 checkHealth();
 loadSessions();

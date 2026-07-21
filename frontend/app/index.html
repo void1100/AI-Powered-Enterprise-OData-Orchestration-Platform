@@ -24,7 +24,12 @@
         <h2>Chats</h2>
         <button id="newChatBtn" title="New chat">+</button>
       </div>
-      <ul id="sessionList" class="session-list"></ul>
+      <div class="session-scroll-wrap">
+        <ul id="sessionList" class="session-list"></ul>
+        <div id="sessionScrollbar" class="session-scrollbar" aria-hidden="true">
+          <div id="sessionScrollbarThumb" class="session-scrollbar-thumb"></div>
+        </div>
+      </div>
       <div class="sidebar-footer">
         <label>Role:
           <select id="roleSelect">
