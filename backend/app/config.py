@@ -34,9 +34,11 @@ class Settings(BaseSettings):
 
     cors_origins: str = "http://localhost:3000,http://localhost:5173"
 
+    n8n_integration_token: str = ""
     n8n_webhook_url: str = "http://n8n:5678/webhook/chat-share"
     n8n_email_webhook_url: str = "http://n8n:5678/webhook/email-share"
     n8n_whatsapp_webhook_url: str = "http://n8n:5678/webhook/whatsapp-share"
+    teams_webhook_url: str = ""
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_user: str = ""

@@ -28,6 +28,9 @@ from app.schemas.models import (
     TableData,
 )
 from app.services.service_manager import service_manager
+from app.services.n8n_integration import router as n8n_router
+from app.services.twilio_webhook import router as twilio_router
+from app.services.teams_webhook import router as teams_router
 from app.services.column_filter import filter_columns
 from app.agents.orchestrator import orchestrator
 from app.agents.policy_engine import policy_engine
@@ -81,6 +84,15 @@ app.add_middleware(
 # Register admin/auth routes
 from app.admin.routes import router as admin_router
 app.include_router(admin_router, tags=["auth", "admin"])
+
+# Register n8n integration routes
+app.include_router(n8n_router)
+
+# Register Twilio webhook routes
+app.include_router(twilio_router)
+
+# Register Teams webhook routes
+app.include_router(teams_router)
 
 
 @app.get("/")
@@ -2402,8 +2414,18 @@ async def share_chat(request: Request):
         "slack": settings.n8n_webhook_url,
         "email": settings.n8n_email_webhook_url,
         "whatsapp": settings.n8n_whatsapp_webhook_url,
+        "teams": settings.teams_webhook_url,
     }
     webhook_url = webhook_urls.get(channel, settings.n8n_webhook_url)
+
+    if channel == "teams" and settings.teams_webhook_url:
+        from app.services.teams_webhook import send_to_teams_webhook
+        sent = await send_to_teams_webhook(settings.teams_webhook_url, share_text, f"OData Share - {query[:50]}")
+        return {
+            "success": sent,
+            "channel": "teams",
+            "share_text": share_text,
+        }
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:

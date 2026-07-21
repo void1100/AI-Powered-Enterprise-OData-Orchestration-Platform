@@ -48,6 +48,8 @@ services:
       NVIDIA_BASE_URL: ${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}
       NVIDIA_MODEL: ${NVIDIA_MODEL:-nvidia/nemotron-3-nano-omni-30b-a3b-reasoning}
       LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      N8N_INTEGRATION_TOKEN: ${N8N_INTEGRATION_TOKEN:-}
+      TEAMS_WEBHOOK_URL: ${TEAMS_WEBHOOK_URL:-}
       CORS_ORIGINS: "http://localhost,http://localhost:80,http://localhost:3000,http://frontend,http://frontend:80"
     depends_on:
       neo4j:
@@ -122,6 +124,10 @@ services:
       - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN:-}
       - TWILIO_WHATSAPP_NUMBER=${TWILIO_WHATSAPP_NUMBER:-whatsapp:+14155238886}
       - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      - N8N_INTEGRATION_TOKEN=${N8N_INTEGRATION_TOKEN:-}
+      - TEAMS_WEBHOOK_URL=${TEAMS_WEBHOOK_URL:-}
+      - N8N_API_KEY=n8n-api-key-f4653661832cdd536d28b62539f9b7db5b76f20f395dc867f3a8c90c924f9f71
+      - N8N_PUBLIC_API_ENABLED=true
     ports:
       - "5678:5678"
     volumes:

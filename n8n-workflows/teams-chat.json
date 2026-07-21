@@ -1,0 +1,151 @@
+{
+  "name": "Teams Chat - OData Chatbot",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "teams-chat",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-teams-in",
+      "name": "Teams Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 300],
+      "webhookId": "teams-chat"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\nlet message = '', channelId = 'teams:unknown', userName = 'User';\n\nif (body.text !== undefined) {\n  message = (body.text || '').replace(/<at>[^<]*<\\/at>/gi, '').trim();\n  channelId = body.channelId || body.conversation?.id || 'teams:unknown';\n  userName = body.from?.name || 'Teams User';\n} else {\n  message = body.message || body.text || '';\n  channelId = body.from || body.channel_id || 'teams:unknown';\n  userName = body.user_name || body.name || 'Teams User';\n}\n\nreturn [{json: {\n  message: String(message).trim(),\n  channelId: String(channelId),\n  userName: String(userName)\n}}];"
+      },
+      "id": "extract-teams",
+      "name": "Extract Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [490, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://backend:8000/integrations/n8n/chat",
+        "authentication": "none",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "message",
+              "value": "={{ $json.message }}"
+            },
+            {
+              "name": "channel_id",
+              "value": "={{ $json.channelId }}"
+            },
+            {
+              "name": "channel_type",
+              "value": "teams"
+            },
+            {
+              "name": "user_name",
+              "value": "={{ $json.userName }}"
+            }
+          ]
+        },
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer odata-n8n-secret-token-2024"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "retryOnFail": true,
+          "maxTries": 2
+        }
+      },
+      "id": "call-backend",
+      "name": "Call OData Backend",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [730, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $input.first().json;\nlet reply = '';\nif (r.text) reply += r.text;\nif (r.table_text) reply += '\\n\\n' + r.table_text;\nif (r.error) reply = 'Error: ' + r.error;\nif (!reply.trim()) reply = 'No result generated.';\n\nreturn [{json: {reply: reply.trim()}}];"
+      },
+      "id": "format-reply",
+      "name": "Format Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [970, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"success\": true, \"reply\": $json.reply } }}",
+        "options": {}
+      },
+      "id": "respond-webhook",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1210, 300]
+    }
+  ],
+  "connections": {
+    "Teams Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Message": {
+      "main": [
+        [
+          {
+            "node": "Call OData Backend",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call OData Backend": {
+      "main": [
+        [
+          {
+            "node": "Format Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Reply": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {},
+  "staticData": null,
+  "tags": []
+}

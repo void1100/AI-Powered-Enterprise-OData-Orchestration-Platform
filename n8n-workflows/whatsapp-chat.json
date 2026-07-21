@@ -1,0 +1,93 @@
+{
+  "name": "WhatsApp Chat - OData Chatbot",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-chat",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-whatsapp-in",
+      "name": "WhatsApp Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 300],
+      "webhookId": "whatsapp-chat"
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst body = d.body || d;\nlet message = '', from = '';\n\nif (body.Body !== undefined) {\n  message = body.Body || '';\n  from = body.From || '';\n} else if (body.message || body.text) {\n  message = body.message || body.text || '';\n  from = body.from || '';\n}\n\nconst msg = String(message).trim();\nconst fromNum = String(from).trim();\n\nreturn [{json: {message: msg, from: fromNum}}];"
+      },
+      "id": "extract-msg",
+      "name": "Extract Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [490, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://backend:8000/integrations/n8n/chat",
+        "authentication": "none",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "message", "value": "={{ $json.message }}" },
+            { "name": "channel_id", "value": "={{ $json.from }}" },
+            { "name": "channel_type", "value": "whatsapp" },
+            { "name": "user_name", "value": "WhatsApp User" }
+          ]
+        },
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer odata-n8n-secret-token-2024" }
+          ]
+        },
+        "options": { "timeout": 120000, "retryOnFail": true, "maxTries": 2 }
+      },
+      "id": "call-backend",
+      "name": "Call OData Backend",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [730, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $input.first().json;\nconst fromNum = $('Extract Message').first().json.from;\nlet reply = '';\nif (r.text) reply += r.text;\nif (r.table_text) reply += '\\n\\n' + r.table_text;\nif (r.error) reply = 'Error: ' + r.error;\nif (!reply.trim()) reply = 'No result generated.';\n\n// Escape XML special characters\nconst esc = (s) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');\n\n// TwiML response\nconst twiml = '<?xml version=\"1.0\" encoding=\"UTF-8\"?>\\n' +\n  '<Response>\\n' +\n  '  <Message>' + esc(reply.trim()) + '</Message>\\n' +\n  '</Response>';\n\nreturn [{json: {twiml: twiml, from: fromNum}}];"
+      },
+      "id": "format-twiml",
+      "name": "Format TwiML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [970, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.twiml }}",
+        "responseHeaders": {
+          "entries": [
+            { "name": "Content-Type", "value": "text/xml; charset=utf-8" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "respond-webhook",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1210, 300]
+    }
+  ],
+  "connections": {
+    "WhatsApp Webhook": { "main": [[{ "node": "Extract Message", "type": "main", "index": 0 }]] },
+    "Extract Message": { "main": [[{ "node": "Call OData Backend", "type": "main", "index": 0 }]] },
+    "Call OData Backend": { "main": [[{ "node": "Format TwiML", "type": "main", "index": 0 }]] },
+    "Format TwiML": { "main": [[{ "node": "Respond to Webhook", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": {},
+  "staticData": null,
+  "tags": []
+}

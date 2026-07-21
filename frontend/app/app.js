@@ -2344,7 +2344,7 @@ document.querySelectorAll(".share-channel-btn").forEach((btn) => {
       }
       return;
     }
-    if (channel === "email" || channel === "whatsapp" || channel === "slack") {
+    if (channel === "email" || channel === "whatsapp" || channel === "slack" || channel === "teams") {
       let text = `Query: ${lastQuery}\n\n${lastSummary}`;
       if (lastTable && lastTable.rows) {
         const cols = lastTable.columns;
@@ -2358,7 +2358,7 @@ document.querySelectorAll(".share-channel-btn").forEach((btn) => {
           body: { channel, query: lastQuery, summary: lastSummary, table: lastTable, session_id: currentSessionId || "" },
         });
         if (resp.success) {
-          const labels = { email: "Email sent!", whatsapp: "WhatsApp sent!", slack: "Shared to Slack!" };
+          const labels = { email: "Email sent!", whatsapp: "WhatsApp sent!", slack: "Shared to Slack!", teams: "Shared to Teams!" };
           shareStatus.textContent = labels[channel] || "Shared!";
           shareStatus.className = "share-status success";
         } else {
