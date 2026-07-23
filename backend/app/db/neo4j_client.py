@@ -10,7 +10,7 @@ class Neo4jClient:
         self._driver: Optional[Driver] = None
         self._connect()
 
-    def _connect(self, retries=3, delay=5):
+    def _connect(self, retries=8, delay=5):
         for attempt in range(retries):
             try:
                 self._driver = GraphDatabase.driver(

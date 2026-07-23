@@ -43,7 +43,10 @@ class ServiceDiscoveryAgent:
             })
         if not candidates:
             for svc in service_manager.list_services():
+                healthy = svc.get("healthy_entity_sets")
                 for es in svc.get("entity_sets", []):
+                    if healthy is not None and es not in healthy:
+                        continue
                     rels = self.graph().find_related_entities(svc["id"], es)
                     candidates.append({
                         "service_id": svc["id"],

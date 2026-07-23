@@ -33,6 +33,7 @@ def _init_schema(conn: sqlite3.Connection):
             id TEXT PRIMARY KEY,
             title TEXT,
             user_role TEXT,
+            user_id TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -62,28 +63,59 @@ def _init_schema(conn: sqlite3.Connection):
     )
     conn.commit()
 
+    # --- Backward-compatible migration: add user_id column if missing ---
+    existing_cols = {row[1] for row in cur.execute("PRAGMA table_info(sessions)").fetchall()}
+    if "user_id" not in existing_cols:
+        cur.execute("ALTER TABLE sessions ADD COLUMN user_id TEXT")
+        conn.commit()
+        logger.info("Migrated sessions table: added user_id column")
 
-def create_session(title: str = "New Chat", user_role: str = "Admin") -> str:
+
+def create_session(title: str = "New Chat", user_role: str = "Admin", user_id: Optional[str] = None) -> str:
     sid = str(uuid.uuid4())
     now = datetime.utcnow().isoformat()
     with _lock:
         conn = _get_conn()
         conn.execute(
-            "INSERT INTO sessions (id, title, user_role, created_at, updated_at) VALUES (?,?,?,?,?)",
-            (sid, title, user_role, now, now),
+            "INSERT INTO sessions (id, title, user_role, user_id, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+            (sid, title, user_role, user_id, now, now),
         )
         conn.commit()
     return sid
 
 
-def list_sessions(limit: int = 50) -> List[Dict[str, Any]]:
+def list_sessions(limit: int = 50, user_id: Optional[str] = None, is_admin: bool = False) -> List[Dict[str, Any]]:
+    """
+    Return sessions scoped to the requesting user.
+    - Admins (is_admin=True) see ALL sessions.
+    - Regular users see only their own sessions (filtered by user_id).
+    - If user_id is None and not admin (unauthenticated), returns all for backward compat.
+    """
+    with _lock:
+        conn = _get_conn()
+        if is_admin or user_id is None:
+            cur = conn.execute(
+                "SELECT id, title, user_role, user_id, created_at, updated_at FROM sessions ORDER BY updated_at DESC LIMIT ?",
+                (limit,),
+            )
+        else:
+            cur = conn.execute(
+                "SELECT id, title, user_role, user_id, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?",
+                (user_id, limit),
+            )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_session(session_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch a single session by ID."""
     with _lock:
         conn = _get_conn()
         cur = conn.execute(
-            "SELECT id, title, user_role, created_at, updated_at FROM sessions ORDER BY updated_at DESC LIMIT ?",
-            (limit,),
+            "SELECT id, title, user_role, user_id, created_at, updated_at FROM sessions WHERE id = ?",
+            (session_id,),
         )
-        return [dict(r) for r in cur.fetchall()]
+        row = cur.fetchone()
+        return dict(row) if row else None
 
 
 def rename_session(session_id: str, title: str):

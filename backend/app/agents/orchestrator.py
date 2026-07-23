@@ -106,7 +106,7 @@ def _apply_safety_caps(plan: Dict[str, Any]) -> Dict[str, Any]:
         service_id = step.get("service_id", "")
         svc = service_manager._services.get(service_id, {})
         is_sap_cpi = "service=" in svc.get("base_url", "").lower() or "metadata=true" in svc.get("base_url", "").lower()
-        cap = 2 if is_sap_cpi else TOP_SAFETY_CAP
+        cap = 10 if is_sap_cpi else TOP_SAFETY_CAP
         if step.get("top") is None:
             step["top"] = cap
         elif isinstance(step.get("top"), int) and step["top"] > cap:

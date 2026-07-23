@@ -400,7 +400,7 @@ class ODataClient:
     # ─── Write Operations ────────────────────────────────────────────────
     async def create(self, entity_set: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """POST a new entity to the OData service."""
-        url = f"{self._get_data_base_url()}/{entity_set}"
+        url = self._build_sap_cpi_url(entity_set) if self._is_sap_cpi() else f"{self._get_data_base_url()}/{entity_set}"
         client = await self._get_client()
         headers = {
             "Accept": "application/json",
@@ -409,15 +409,23 @@ class ODataClient:
         headers.update(self._get_auth_headers())
         resp = await client.post(url, json=data, headers=headers)
         resp.raise_for_status()
-        if resp.status_code == 201:
-            return resp.json()
+        if resp.content:
+            try:
+                return resp.json()
+            except ValueError:
+                return {"status": resp.status_code, "success": True, "body": resp.text}
         return {"status": resp.status_code, "success": True}
 
     async def update(
         self, entity_set: str, entity_id: str, data: Dict[str, Any]
     ) -> Dict[str, Any]:
         """PATCH an existing entity."""
-        url = f"{self._get_data_base_url()}/{entity_set}({entity_id})"
+        if self._is_sap_cpi():
+            base_url = self._build_sap_cpi_url(entity_set)
+            separator = "&" if "?" in base_url else "?"
+            url = f"{base_url}{separator}key={entity_id}"
+        else:
+            url = f"{self._get_data_base_url()}/{entity_set}({entity_id})"
         client = await self._get_client()
         headers = {
             "Accept": "application/json",
@@ -432,7 +440,12 @@ class ODataClient:
 
     async def delete(self, entity_set: str, entity_id: str) -> Dict[str, Any]:
         """DELETE an entity."""
-        url = f"{self._get_data_base_url()}/{entity_set}({entity_id})"
+        if self._is_sap_cpi():
+            base_url = self._build_sap_cpi_url(entity_set)
+            separator = "&" if "?" in base_url else "?"
+            url = f"{base_url}{separator}key={entity_id}"
+        else:
+            url = f"{self._get_data_base_url()}/{entity_set}({entity_id})"
         client = await self._get_client()
         headers = {"Accept": "application/json"}
         headers.update(self._get_auth_headers())

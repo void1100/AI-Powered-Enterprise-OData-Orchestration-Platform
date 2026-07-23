@@ -2690,47 +2690,130 @@ const closeWriteHistory = $("closeWriteHistory");
 
 let pendingWriteOp = null;
 
-function openWriteConfirmModal(data) {
-  pendingWriteOp = data;
+function buildWriteReviewRows(fields) {
+  return Object.entries(fields || {}).map(([k, v]) => `
+    <div class="write-form-review-row">
+      <span>${escapeHtml(k)}</span>
+      <strong>${escapeHtml(String(v))}</strong>
+    </div>
+  `).join("");
+}
+
+function renderWriteConfirmState() {
+  if (!pendingWriteOp) return;
+  const data = pendingWriteOp;
   const op = data.operation || "create";
   const opLabels = { create: "Create", update: "Update", delete: "Delete" };
   const opClass = `op-${op}`;
-  writeConfirmTitle.textContent = `${opLabels[op] || op} Confirmation`;
+  const opLabel = opLabels[op] || op;
+  const entityName = data.entity_set || "Entity";
+  const serviceName = data.service_id || "service";
+  const existingFieldRows = buildWriteReviewRows(data.fields && typeof data.fields === "object" ? data.fields : {});
 
-  let summaryHtml = `<span class="op-label ${opClass}">${op}</span> `;
-  summaryHtml += `<strong>${escapeHtml(data.entity_set || "")}</strong> `;
-  summaryHtml += `<span style="color:var(--text-muted)">on ${escapeHtml(data.service_id || "")}</span>`;
-  if (data.fields && Object.keys(data.fields).length > 0) {
-    summaryHtml += `<br><br><strong>Fields:</strong><br>`;
-    for (const [k, v] of Object.entries(data.fields)) {
-      summaryHtml += `<code>${escapeHtml(k)}</code>: ${escapeHtml(String(v))}<br>`;
-    }
-  }
-  writeConfirmSummary.innerHTML = summaryHtml;
+  writeConfirmTitle.textContent = `${opLabel} ${entityName}`;
+  writeConfirmSummary.innerHTML = `
+    <div class="write-form-hero ${opClass}">
+      <span class="op-label ${opClass}">${escapeHtml(op)}</span>
+      <div class="write-form-title">${escapeHtml(opLabel)} ${escapeHtml(entityName)}</div>
+      <div class="write-form-subtitle">Service: ${escapeHtml(serviceName)}</div>
+    </div>
+    <div class="write-form-meta">
+      <div>
+        <span>Action</span>
+        <strong>${escapeHtml(opLabel)}</strong>
+      </div>
+      <div>
+        <span>Entity</span>
+        <strong>${escapeHtml(entityName)}</strong>
+      </div>
+      <div>
+        <span>Service</span>
+        <strong>${escapeHtml(serviceName)}</strong>
+      </div>
+      ${data.entity_id ? `<div><span>Record ID</span><strong>${escapeHtml(String(data.entity_id))}</strong></div>` : ""}
+    </div>
+    ${existingFieldRows ? `
+      <div class="write-form-section">
+        <div class="write-form-section-title">Values already detected</div>
+        <div class="write-form-review">${existingFieldRows}</div>
+      </div>
+    ` : ""}
+  `;
 
-  // Render missing required fields as inputs
   const missing = data.missing_fields || [];
   const required = data.required_fields || [];
   const optional = data.optional_fields || [];
   let fieldsHtml = "";
 
-  if (missing.length > 0) {
-    fieldsHtml += `<div style="margin-bottom:8px;font-size:12px;color:var(--warning)">Please provide the required fields:</div>`;
-    missing.forEach((f) => {
-      fieldsHtml += `<label class="field-required">${escapeHtml(f)}</label>`;
-      fieldsHtml += `<input type="text" data-field="${escapeHtml(f)}" placeholder="Enter ${escapeHtml(f)}" />`;
-    });
-  }
+  if (data.stage === "review") {
+    const reviewRows = buildWriteReviewRows(data.reviewFields || {});
+    fieldsHtml = `
+      <div class="write-form-section write-form-review-card">
+        <div class="write-form-section-title">Final confirmation</div>
+        <div class="write-form-section-note">These are the exact values that will be ${escapeHtml(op === "delete" ? "deleted" : "written")} to ${escapeHtml(entityName)}.</div>
+        <div class="write-form-review">${reviewRows || '<div class="write-form-empty">No values supplied.</div>'}</div>
+      </div>
+      <label class="write-form-confirm-check">
+        <input id="writeFinalConfirm" type="checkbox" />
+        <span>I confirm these values are correct and I want to ${escapeHtml(opLabel.toLowerCase())} this record.</span>
+      </label>
+    `;
+    writeConfirmCancel.textContent = "Back";
+    writeConfirmExecute.textContent = "Confirm & Execute";
+  } else {
+    if (missing.length > 0) {
+      fieldsHtml += `
+        <div class="write-form-section">
+          <div class="write-form-section-title">Required values</div>
+          <div class="write-form-section-note">Fill these fields before executing the ${escapeHtml(opLabel.toLowerCase())}.</div>
+        </div>
+      `;
+      missing.forEach((f) => {
+        const fieldValue = data.reviewFields?.[f] || "";
+        fieldsHtml += `
+          <div class="write-form-question">
+            <label class="field-required">${escapeHtml(f)}</label>
+            <input type="text" data-field="${escapeHtml(f)}" value="${escapeHtml(String(fieldValue))}" placeholder="Enter ${escapeHtml(f)}" />
+          </div>
+        `;
+      });
+    }
 
-  if (required.length > 0 && missing.length === 0) {
-    fieldsHtml += `<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Required fields are already provided.</div>`;
-  }
+    if (required.length > 0 && missing.length === 0) {
+      fieldsHtml += `
+        <div class="write-form-section">
+          <div class="write-form-section-title">Required values</div>
+          <div class="write-form-section-note">All required fields are already provided.</div>
+        </div>
+      `;
+    }
 
-  if (optional.length > 0) {
-    fieldsHtml += `<div style="margin-top:10px;font-size:11px;color:var(--text-muted)">Optional fields: ${optional.slice(0, 8).join(", ")}${optional.length > 8 ? "..." : ""}</div>`;
+    if (optional.length > 0) {
+      fieldsHtml += `
+        <details class="write-form-optional" open>
+          <summary>Optional fields (${optional.length}) — fill any you need</summary>
+          <div class="write-form-optional-list">
+            ${optional.map((f) => {
+              const fieldValue = data.reviewFields?.[f] || "";
+              return `<div class="write-form-question">
+                <label>${escapeHtml(f)}</label>
+                <input type="text" data-field="${escapeHtml(f)}" value="${escapeHtml(String(fieldValue))}" placeholder="${escapeHtml(f)} (optional)" />
+              </div>`;
+            }).join("")}
+          </div>
+        </details>
+      `;
+    }
+    writeConfirmCancel.textContent = "Cancel";
+    writeConfirmExecute.textContent = "Review Changes";
   }
 
   writeConfirmFields.innerHTML = fieldsHtml;
+}
+
+function openWriteConfirmModal(data) {
+  pendingWriteOp = { ...data, stage: "edit", reviewFields: { ...(data.fields || {}) } };
+  renderWriteConfirmState();
   writeConfirmStatus.textContent = "";
   writeConfirmStatus.className = "write-confirm-status";
   writeConfirmExecute.disabled = false;
@@ -2743,20 +2826,45 @@ function closeWriteConfirmModal() {
 }
 
 closeWriteConfirm.addEventListener("click", closeWriteConfirmModal);
-writeConfirmCancel.addEventListener("click", closeWriteConfirmModal);
+writeConfirmCancel.addEventListener("click", () => {
+  if (pendingWriteOp && pendingWriteOp.stage === "review") {
+    pendingWriteOp.stage = "edit";
+    writeConfirmStatus.textContent = "";
+    writeConfirmStatus.className = "write-confirm-status";
+    writeConfirmExecute.disabled = false;
+    renderWriteConfirmState();
+    return;
+  }
+  closeWriteConfirmModal();
+});
 
 writeConfirmExecute.addEventListener("click", async () => {
   if (!pendingWriteOp) return;
 
-  // Collect values from any dynamically added input fields
-  const inputs = writeConfirmFields.querySelectorAll("input[data-field]");
-  const extraFields = {};
-  inputs.forEach((inp) => {
-    const val = inp.value.trim();
-    if (val) extraFields[inp.dataset.field] = val;
-  });
+  if (pendingWriteOp.stage !== "review") {
+    const inputs = writeConfirmFields.querySelectorAll("input[data-field]");
+    const extraFields = {};
+    inputs.forEach((inp) => {
+      const val = inp.value.trim();
+      if (val) extraFields[inp.dataset.field] = val;
+    });
+    const mergedFields = { ...(pendingWriteOp.fields || {}), ...extraFields };
+    pendingWriteOp.reviewFields = mergedFields;
+    pendingWriteOp.stage = "review";
+    writeConfirmStatus.textContent = "Review the exact values below, then confirm the write.";
+    writeConfirmStatus.className = "write-confirm-status";
+    renderWriteConfirmState();
+    return;
+  }
 
-  const mergedFields = { ...(pendingWriteOp.fields || {}), ...extraFields };
+  const finalConfirm = $("writeFinalConfirm");
+  if (!finalConfirm || !finalConfirm.checked) {
+    writeConfirmStatus.textContent = "Confirm the checkbox before executing the write.";
+    writeConfirmStatus.className = "write-confirm-status error";
+    return;
+  }
+
+  const mergedFields = { ...(pendingWriteOp.reviewFields || {}) };
   const op = {
     operation: pendingWriteOp.operation,
     entity_set: pendingWriteOp.entity_set,
@@ -2781,7 +2889,15 @@ writeConfirmExecute.addEventListener("click", async () => {
     } else {
       writeConfirmStatus.textContent = resp.summary || "Operation completed successfully.";
       writeConfirmStatus.className = "write-confirm-status success";
-      addAssistantBubble(resp.summary || "Write operation completed.", null, true);
+      addAssistantBubble(resp.summary || "Write operation completed.", {
+        table: resp.table,
+        tool_calls: [{
+          type: `odata.${resp.operation || "write"}`,
+          service_id: resp.service_id || op.service_id,
+          entity_set: resp.entity_set || op.entity_set,
+          row_count: resp.table?.row_count || (resp.created_record ? 1 : 0),
+        }],
+      }, true);
       setTimeout(closeWriteConfirmModal, 2000);
     }
   } catch (e) {

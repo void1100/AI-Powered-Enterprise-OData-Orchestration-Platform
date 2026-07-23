@@ -250,10 +250,15 @@ class LLMReasoningEngine:
 
     def _truncate_service_for_llm(self, svc: Dict[str, Any], max_entities: int = 15, max_props_per_entity: int = 8) -> Dict[str, Any]:
         """Truncate service data to fit within LLM token limits.
-        For large services, send only suggested entity names + limited properties."""
+        For large services, send only suggested entity names + limited properties.
+        Filters out unhealthy entities that return 500 errors."""
         entity_props = svc.get("entity_properties", {})
         entity_sets = svc.get("entity_sets", [])
         entity_labels = svc.get("entity_labels", {})
+
+        healthy = svc.get("healthy_entity_sets")
+        if healthy is not None:
+            entity_sets = [e for e in entity_sets if e in healthy]
 
         if len(entity_sets) <= max_entities:
             return {

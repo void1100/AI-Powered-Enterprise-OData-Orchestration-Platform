@@ -1110,7 +1110,10 @@ async function loadAnalytics(el) {
 
 // --- Settings ---
 async function loadSettings(el) {
-  const settings = await api("/admin/settings");
+  const [settings, services] = await Promise.all([
+    api("/admin/settings"),
+    api("/services"),
+  ]);
   el.innerHTML = `
     <div class="table-wrap">
       <div class="table-header"><h2>System Settings</h2></div>
@@ -1138,7 +1141,98 @@ async function loadSettings(el) {
         </form>
       </div>
     </div>
+    <div class="table-wrap" style="margin-top:20px">
+      <div class="table-header">
+        <h2>Entity Health Monitor</h2>
+        <button class="btn btn-sm" onclick="refreshAllHealth()">Re-check All</button>
+      </div>
+      <div id="healthResults" style="padding:20px">
+        ${services.map(s => `
+          <div class="health-service" id="health-${s.id}" style="margin-bottom:16px;border:1px solid var(--border);border-radius:8px;overflow:hidden">
+            <div style="padding:12px 16px;display:flex;align-items:center;gap:12px;background:var(--bg-alt)">
+              <strong>${escapeHtml(s.name)}</strong>
+              <span class="health-badge" id="badge-${s.id}" style="font-size:12px;padding:2px 8px;border-radius:10px;background:var(--bg);color:var(--text-muted)">Loading...</span>
+              <button class="btn btn-sm" style="margin-left:auto" onclick="recheckHealth('${s.id}')">Re-check</button>
+            </div>
+            <div id="entities-${s.id}" style="padding:12px 16px">
+              <div style="color:var(--text-muted);font-size:13px">Checking entities...</div>
+            </div>
+          </div>
+        `).join("")}
+      </div>
+    </div>
   `;
+  services.forEach(s => loadServiceHealth(s));
+}
+
+async function loadServiceHealth(svc) {
+  try {
+    const h = await api(`/services/${svc.id}`);
+    const badge = document.getElementById(`badge-${svc.id}`);
+    const entDiv = document.getElementById(`entities-${svc.id}`);
+    const healthy = (h.healthy_entity_sets || []).length;
+    const unhealthy = (h.unhealthy_entity_sets || []).length;
+    const total = healthy + unhealthy;
+    if (total === 0) {
+      badge.textContent = "No data";
+      badge.style.background = "var(--bg)";
+      entDiv.innerHTML = '<div style="color:var(--text-muted);font-size:13px">Health check pending...</div>';
+      return;
+    }
+    const pct = Math.round((healthy / total) * 100);
+    const color = unhealthy === 0 ? "var(--success)" : healthy === 0 ? "var(--danger)" : "var(--warning)";
+    badge.textContent = `${healthy}/${total} healthy (${pct}%)`;
+    badge.style.background = color;
+    badge.style.color = "#fff";
+    let html = "";
+    if (h.unhealthy_entity_sets && h.unhealthy_entity_sets.length > 0) {
+      html += `<div style="margin-bottom:8px"><strong style="color:var(--danger);font-size:13px">Unhealthy (${unhealthy})</strong></div>`;
+      html += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px">';
+      h.unhealthy_entity_sets.forEach(e => {
+        html += `<span style="font-size:12px;padding:3px 8px;border-radius:4px;background:rgba(239,68,68,0.1);color:var(--danger);border:1px solid rgba(239,68,68,0.2)">${escapeHtml(e)}</span>`;
+      });
+      html += '</div>';
+    }
+    if (h.healthy_entity_sets && h.healthy_entity_sets.length > 0) {
+      html += `<div style="margin-bottom:8px"><strong style="color:var(--success);font-size:13px">Healthy (${healthy})</strong></div>`;
+      html += '<div style="display:flex;flex-wrap:wrap;gap:6px">';
+      h.healthy_entity_sets.slice(0, 30).forEach(e => {
+        html += `<span style="font-size:12px;padding:3px 8px;border-radius:4px;background:rgba(34,197,94,0.1);color:var(--success);border:1px solid rgba(34,197,94,0.2)">${escapeHtml(e)}</span>`;
+      });
+      if (healthy > 30) html += `<span style="font-size:12px;padding:3px 8px;color:var(--text-muted)">+${healthy - 30} more</span>`;
+      html += '</div>';
+    }
+    entDiv.innerHTML = html;
+  } catch (e) {
+    document.getElementById(`entities-${svc.id}`).innerHTML = `<div style="color:var(--danger);font-size:13px">Error: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function recheckHealth(serviceId) {
+  const badge = document.getElementById(`badge-${serviceId}`);
+  const entDiv = document.getElementById(`entities-${serviceId}`);
+  badge.textContent = "Checking...";
+  badge.style.background = "var(--bg)";
+  badge.style.color = "var(--text-muted)";
+  entDiv.innerHTML = '<div style="color:var(--text-muted);font-size:13px">Re-checking entities...</div>';
+  try {
+    await api(`/services/${serviceId}/healthcheck`, { method: "POST" });
+    const svc = (await api("/services")).find(s => s.id === serviceId);
+    if (svc) await loadServiceHealth(svc);
+  } catch (e) {
+    badge.textContent = "Error";
+    badge.style.background = "var(--danger)";
+    badge.style.color = "#fff";
+    entDiv.innerHTML = `<div style="color:var(--danger);font-size:13px">Error: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function refreshAllHealth() {
+  const services = await api("/services");
+  for (const s of services) {
+    await recheckHealth(s.id);
+  }
+  toast("All services re-checked");
 }
 
 async function saveSettings(e) {

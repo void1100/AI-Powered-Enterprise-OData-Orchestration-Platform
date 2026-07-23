@@ -23,6 +23,8 @@ class ServiceInfo(BaseModel):
     entity_sets: List[str] = []
     entity_properties: Dict[str, List[str]] = {}
     entity_labels: Dict[str, Dict[str, Any]] = {}
+    healthy_entity_sets: Optional[List[str]] = None
+    unhealthy_entity_sets: Optional[List[str]] = None
 
 
 class ChatRequest(BaseModel):
@@ -107,12 +109,15 @@ class ChatResponse(BaseModel):
 class SessionCreate(BaseModel):
     title: str = "New Chat"
     user_role: str = "Admin"
+    # user_id is intentionally NOT accepted from the client —
+    # it is always injected server-side from the JWT token.
 
 
 class SessionInfo(BaseModel):
     id: str
     title: str
     user_role: str
+    user_id: Optional[str] = None  # owner of this session
     created_at: str
     updated_at: str
 

@@ -282,36 +282,142 @@ function renderTable(table) {
   csvBtn.title = `Export ${table.rows.length} rows to CSV`;
   csvBtn.addEventListener("click", () => downloadCsv(table, "odata_result"));
   toolbar.appendChild(csvBtn);
-  wrap.appendChild(toolbar);
-  const tableEl = document.createElement("table");
-  const thead = document.createElement("thead");
-  const trh = document.createElement("tr");
-  table.columns.forEach((c) => {
-    const th = document.createElement("th");
-    th.textContent = c;
-    trh.appendChild(th);
-  });
-  thead.appendChild(trh);
-  tableEl.appendChild(thead);
-  const tbody = document.createElement("tbody");
-  table.rows.forEach((row) => {
-    const tr = document.createElement("tr");
-    table.columns.forEach((c) => {
-      const td = document.createElement("td");
-      const v = row[c];
-      td.textContent = typeof v === "object" && v !== null ? JSON.stringify(v) : (v ?? "");
-      tr.appendChild(td);
+
+  // Hidden columns toggle
+  const hiddenCols = table.hidden_columns || [];
+  let showingAllCols = false;
+  let allColsBtn = null;
+  if (hiddenCols.length > 0) {
+    allColsBtn = document.createElement("button");
+    allColsBtn.className = "csv-btn";
+    allColsBtn.style.cssText = "background:rgba(99,102,241,0.15);color:#818cf8;border-color:rgba(99,102,241,0.3);margin-left:8px;";
+    allColsBtn.textContent = `Show All Columns (+${hiddenCols.length} hidden)`;
+    allColsBtn.title = `Hidden: ${hiddenCols.map(h => h.name).join(", ")}`;
+    allColsBtn.addEventListener("click", () => {
+      showingAllCols = !showingAllCols;
+      rebuildTable();
+      allColsBtn.textContent = showingAllCols
+        ? `Smart View (hide ${hiddenCols.length} low-priority)`
+        : `Show All Columns (+${hiddenCols.length} hidden)`;
+      allColsBtn.style.background = showingAllCols
+        ? "rgba(16,185,129,0.15)"
+        : "rgba(99,102,241,0.15)";
+      allColsBtn.style.color = showingAllCols ? "#34d399" : "#818cf8";
     });
-    tbody.appendChild(tr);
-  });
-  tableEl.appendChild(tbody);
-  wrap.appendChild(tableEl);
+    toolbar.appendChild(allColsBtn);
+  }
+
+  // Priority legend pill
+  const legendPill = document.createElement("span");
+  legendPill.style.cssText = "margin-left:auto;font-size:10px;color:var(--text-muted,#94a3b8);display:flex;gap:6px;align-items:center;";
+  legendPill.innerHTML = `
+    <span style="display:inline-flex;align-items:center;gap:3px"><span style="background:#f59e0b;border-radius:3px;width:8px;height:8px;display:inline-block;"></span>Key</span>
+    <span style="display:inline-flex;align-items:center;gap:3px"><span style="background:#3b82f6;border-radius:3px;width:8px;height:8px;display:inline-block;"></span>Business</span>
+    <span style="display:inline-flex;align-items:center;gap:3px"><span style="background:#6b7280;border-radius:3px;width:8px;height:8px;display:inline-block;"></span>Other</span>`;
+  toolbar.appendChild(legendPill);
+
+  wrap.appendChild(toolbar);
+
+  // ── Classify columns for badge rendering ─────────────────────────────────
+  const priorities = table.column_priorities || {};
+
+  function getColBadge(col) {
+    const p = priorities[col];
+    // From backend priority metadata
+    if (p) {
+      if (p.isKey) return { label: "KEY", color: "#f59e0b", bg: "rgba(245,158,11,0.12)" };
+      if (p.isLineItem || p.importance === "HIGH")
+        return { label: "UI", color: "#a78bfa", bg: "rgba(167,139,250,0.12)" };
+    }
+    // Fallback: client-side heuristics
+    if (/(ID|Id|Code|Key)$/.test(col))
+      return { label: "KEY", color: "#f59e0b", bg: "rgba(245,158,11,0.12)" };
+    if (/(Name|Status|Date|Amount|Price|Quantity|Material|Order|Plant|Customer|Supplier|Description|Text)$/i.test(col))
+      return { label: "BIZ", color: "#3b82f6", bg: "rgba(59,130,246,0.12)" };
+    if (/(CreatedAt|ChangedAt|Timestamp|ETag|Guid|UUID)$/i.test(col))
+      return { label: "META", color: "#6b7280", bg: "rgba(107,114,128,0.10)" };
+    return null;
+  }
+
+  // ── Table builder (called once initially and on toggle) ───────────────────
+  let tableEl = null;
+  function rebuildTable() {
+    if (tableEl) tableEl.remove();
+
+    const activeCols = showingAllCols
+      ? (table.all_columns || table.columns)
+      : table.columns;
+    const activeRows = showingAllCols
+      ? (table.all_rows || table.rows)
+      : table.rows;
+
+    tableEl = document.createElement("table");
+    const thead = document.createElement("thead");
+    const trh = document.createElement("tr");
+
+    activeCols.forEach((c) => {
+      const th = document.createElement("th");
+      const badge = getColBadge(c);
+      if (badge) {
+        const pillWrap = document.createElement("div");
+        pillWrap.style.cssText = "display:flex;flex-direction:column;align-items:flex-start;gap:2px;";
+        const pillBadge = document.createElement("span");
+        pillBadge.textContent = badge.label;
+        pillBadge.style.cssText = `font-size:9px;font-weight:700;letter-spacing:.5px;padding:1px 5px;border-radius:4px;color:${badge.color};background:${badge.bg};line-height:1.4;`;
+        const pillLabel = document.createElement("span");
+        pillLabel.textContent = c;
+        pillWrap.appendChild(pillBadge);
+        pillWrap.appendChild(pillLabel);
+        th.appendChild(pillWrap);
+        th.title = priorities[c]?.label || c;
+      } else {
+        th.textContent = c;
+      }
+      trh.appendChild(th);
+    });
+
+    thead.appendChild(trh);
+    tableEl.appendChild(thead);
+    const tbody = document.createElement("tbody");
+    activeRows.forEach((row) => {
+      const tr = document.createElement("tr");
+      activeCols.forEach((c) => {
+        const td = document.createElement("td");
+        const v = row[c];
+        td.textContent = typeof v === "object" && v !== null ? JSON.stringify(v) : (v ?? "");
+        // Highlight key columns
+        const badge = getColBadge(c);
+        if (badge && badge.label === "KEY") {
+          td.style.fontWeight = "600";
+          td.style.color = badge.color;
+        }
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    tableEl.appendChild(tbody);
+    wrap.appendChild(tableEl);
+  }
+
+  rebuildTable();
+
+  // ── Row count note ────────────────────────────────────────────────────────
   if (table.truncated || table.row_count > table.rows.length) {
     const note = document.createElement("div");
     note.className = "url-line";
     note.textContent = `Showing ${table.rows.length} of ${table.row_count} rows${table.total_count ? ` (total: ${table.total_count})` : ""}.`;
     wrap.appendChild(note);
   }
+
+  // ── Filter note ───────────────────────────────────────────────────────────
+  if (table.filter_note && hiddenCols.length > 0) {
+    const filterNote = document.createElement("div");
+    filterNote.className = "url-line";
+    filterNote.style.cssText = "color:#818cf8;font-style:italic;";
+    filterNote.textContent = `📊 ${table.filter_note}`;
+    wrap.appendChild(filterNote);
+  }
+
   return wrap;
 }
 

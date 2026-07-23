@@ -24,6 +24,7 @@ class ODataServiceManager:
         self._clients: Dict[str, ODataClient] = {}
         self._entity_to_set: Dict[str, Dict[str, str]] = {}
         self._custom_entities: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._healthy_entities: Dict[str, Dict[str, bool]] = {}
         self._lock = asyncio.Lock()
 
     def graph(self):
@@ -82,7 +83,45 @@ class ODataServiceManager:
             self._clients[service_id] = client
             self._index_service_in_graph(service_id, self._services[service_id])
             self._index_service_in_vector_store(service_id, self._services[service_id])
+            asyncio.create_task(self._health_check_entities(service_id))
             return self._services[service_id]
+
+    async def _health_check_entities(self, service_id: str):
+        svc = self._services.get(service_id)
+        if not svc:
+            return
+        client = self._clients.get(service_id)
+        if not client:
+            return
+        entity_sets = svc["metadata"].get("entity_sets", [])
+        healthy: Dict[str, bool] = {}
+        sem = asyncio.Semaphore(5)
+        http_client = await client._get_client()
+        async def _test_one(es_name: str):
+            async with sem:
+                try:
+                    if client._is_sap_cpi():
+                        url = client._build_sap_cpi_url(es_name, top=1)
+                    else:
+                        url = f"{svc['base_url']}/{es_name}?$top=1"
+                    headers = client._get_auth_headers()
+                    resp = await http_client.get(url, headers=headers, timeout=15)
+                    healthy[es_name] = resp.status_code == 200
+                    if resp.status_code != 200:
+                        logger.warning(f"Health check {service_id}/{es_name}: HTTP {resp.status_code}")
+                except Exception as e:
+                    healthy[es_name] = False
+                    logger.warning(f"Health check {service_id}/{es_name}: {type(e).__name__}: {e}")
+        await asyncio.gather(*[_test_one(es["name"]) for es in entity_sets])
+        self._healthy_entities[service_id] = healthy
+        working = sum(1 for v in healthy.values() if v)
+        svc["healthy_entity_sets"] = [name for name, ok in healthy.items() if ok]
+        svc["unhealthy_entity_sets"] = [name for name, ok in healthy.items() if not ok]
+        logger.info(f"Health check {service_id}: {working}/{len(healthy)} entities healthy")
+
+    def get_healthy_entities(self, service_id: str) -> List[str]:
+        h = self._healthy_entities.get(service_id, {})
+        return [name for name, ok in h.items() if ok]
 
     def _index_service_in_graph(self, service_id: str, svc: Dict[str, Any]):
         g = self.graph()
@@ -239,6 +278,8 @@ class ODataServiceManager:
                 "entity_sets": [es["name"] for es in svc["metadata"].get("entity_sets", [])],
                 "entity_properties": entity_props,
                 "entity_labels": entity_labels,
+                "healthy_entity_sets": svc.get("healthy_entity_sets"),
+                "unhealthy_entity_sets": svc.get("unhealthy_entity_sets"),
             })
         return out
 
@@ -250,9 +291,16 @@ class ODataServiceManager:
         """
         g = self.graph()
         if hasattr(g, '_driver') and g._driver is None:
-            logger.info("Neo4j was unavailable at startup, attempting reconnect...")
-            g._connect(retries=2, delay=3)
-            g = self.graph()
+            logger.info("Neo4j was unavailable at startup, retrying connection...")
+            for attempt in range(5):
+                g._connect(retries=3, delay=5)
+                g = self.graph()
+                if hasattr(g, '_driver') and g._driver is not None:
+                    logger.info(f"Neo4j connected on attempt {attempt+1}")
+                    break
+                logger.info(f"Neo4j still unavailable, waiting 10s before retry ({attempt+1}/5)...")
+                import time as _time
+                _time.sleep(10)
         try:
             persisted = g.list_all_services()
         except Exception as e:

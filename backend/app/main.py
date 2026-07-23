@@ -41,6 +41,7 @@ from app.db.sqlite_store import (
     create_session,
     delete_session,
     get_messages,
+    get_session,
     list_sessions,
     rename_session,
     touch_session,
@@ -133,6 +134,29 @@ async def get_services():
     return service_manager.list_services()
 
 
+@app.get("/services/health")
+async def services_health():
+    services = service_manager.list_services()
+    results = await asyncio.gather(*[_probe_service(s) for s in services])
+    return {"services": results}
+
+
+@app.get("/services/{service_id}", response_model=ServiceInfo)
+async def get_service(service_id: str):
+    svc = service_manager.get_service(service_id)
+    if not svc:
+        raise HTTPException(status_code=404, detail="Service not found")
+    return ServiceInfo(
+        id=svc["id"],
+        name=svc["name"],
+        base_url=svc["base_url"],
+        description=svc["description"],
+        entity_sets=[es["name"] for es in svc["metadata"].get("entity_sets", [])],
+        healthy_entity_sets=svc.get("healthy_entity_sets"),
+        unhealthy_entity_sets=svc.get("unhealthy_entity_sets"),
+    )
+
+
 @app.post("/services", response_model=ServiceInfo)
 async def register_service(payload: ServiceRegister, request: Request):
     user = get_current_user(request)
@@ -161,6 +185,8 @@ async def register_service(payload: ServiceRegister, request: Request):
         base_url=svc["base_url"],
         description=svc["description"],
         entity_sets=[es["name"] for es in svc["metadata"].get("entity_sets", [])],
+        healthy_entity_sets=svc.get("healthy_entity_sets"),
+        unhealthy_entity_sets=svc.get("unhealthy_entity_sets"),
     )
 
 
@@ -189,7 +215,28 @@ async def refresh_service(service_id: str, request: Request):
         base_url=svc["base_url"],
         description=svc["description"],
         entity_sets=[es["name"] for es in svc["metadata"].get("entity_sets", [])],
+        healthy_entity_sets=svc.get("healthy_entity_sets"),
+        unhealthy_entity_sets=svc.get("unhealthy_entity_sets"),
     )
+
+
+@app.post("/services/{service_id}/healthcheck")
+async def healthcheck_service(service_id: str, request: Request):
+    user = get_current_user(request)
+    if not user or user.get("role") not in ("super_admin", "admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if service_id not in service_manager._services:
+        raise HTTPException(status_code=404, detail="Service not found")
+    await service_manager._health_check_entities(service_id)
+    svc = service_manager._services[service_id]
+    return {
+        "service_id": service_id,
+        "total": len(svc.get("metadata", {}).get("entity_sets", [])),
+        "healthy": len(svc.get("healthy_entity_sets", [])),
+        "unhealthy": len(svc.get("unhealthy_entity_sets", [])),
+        "healthy_entity_sets": svc.get("healthy_entity_sets", []),
+        "unhealthy_entity_sets": svc.get("unhealthy_entity_sets", []),
+    }
 
 
 async def _probe_service(svc: Dict[str, Any]) -> Dict[str, Any]:
@@ -238,13 +285,6 @@ async def _probe_service(svc: Dict[str, Any]) -> Dict[str, Any]:
             "latency_ms": latency_ms,
             "error": str(e)[:200],
         }
-
-
-@app.get("/services/health")
-async def services_health():
-    services = service_manager.list_services()
-    results = await asyncio.gather(*[_probe_service(s) for s in services])
-    return {"services": results}
 
 
 def _build_column_labels(service_id: str, entity_set: str, columns: list) -> dict:
@@ -1055,7 +1095,13 @@ async def chat(payload: ChatRequest, request: Request):
 
     session_id = payload.session_id
     if not session_id:
-        session_id = create_session(title=payload.query[:50] or "New Chat", user_role=user_role)
+        # Always bind new sessions to the authenticated user
+        user_id = user.get("sub") if user else None
+        session_id = create_session(
+            title=payload.query[:50] or "New Chat",
+            user_role=user_role,
+            user_id=user_id,
+        )
     else:
         touch_session(session_id)
 
@@ -1914,25 +1960,69 @@ async def write_preview(payload: ChatRequest, request: Request):
     """Preview a write operation and return confirmation summary before executing."""
     from app.services.guardrails import build_write_summary, run_input_guards, get_entity_field_requirements
     from app.agents.reasoning_engine import llm_engine
+    import re as _re
 
     user = get_current_user(request)
     user_role = user.get("role", "user") if user else payload.user_role
 
-    # Use LLM to extract write operation details from natural language
+    # Use LLM / mock planner to extract write operation details from natural language
     services = service_manager.list_services()
     plan, llm_meta = await llm_engine.plan(payload.query, services, memory_context=[])
 
     write_intents = {"create", "update", "delete"}
-    if plan.get("intent") not in write_intents or not plan.get("write_operation"):
+    q_lower = payload.query.lower()
+    inferred_intent = ""
+    if _re.search(r"\b(create|add|new|insert|submit)\b", q_lower):
+        inferred_intent = "create"
+    elif _re.search(r"\b(update|modify|change|edit|set|replace)\b", q_lower):
+        inferred_intent = "update"
+    elif _re.search(r"\b(delete|remove|destroy|drop)\b", q_lower):
+        inferred_intent = "delete"
+
+    # Prefer explicit user wording over a planner miss/misclassification.
+    intent = inferred_intent or plan.get("intent", "")
+
+    if intent not in write_intents:
         return {"error": "Could not detect a write operation in your query. Try phrases like 'create a new order' or 'update customer X'."}
 
-    write_op = plan["write_operation"]
+    # ── Build write_operation from plan steps if planner didn't produce one ───
+    write_op = plan.get("write_operation")
+    if not write_op:
+        # Extract entity/service from the planned steps (mock planner always fills these)
+        first_step = plan.get("steps", [{}])[0] if plan.get("steps") else {}
+        write_op = {
+            "operation": intent,
+            "entity_set": first_step.get("entity_set", ""),
+            "service_id": first_step.get("service_id", ""),
+            "fields": {},
+            "entity_id": None,
+            "confirmed": False,
+        }
+
     entity_set = write_op.get("entity_set", "")
-    operation = write_op.get("operation", plan.get("intent"))
+    operation = write_op.get("operation", intent)
     fields = write_op.get("fields", {})
     entity_id = write_op.get("entity_id")
     service_id = write_op.get("service_id") or (plan.get("target_services", [None])[0] if plan.get("target_services") else None)
     required_fields = write_op.get("required_fields", [])
+
+    if entity_set and not service_id:
+        for svc in services:
+            if entity_set in svc.get("entity_sets", []):
+                service_id = svc.get("id")
+                break
+
+    if not entity_set:
+        q_words = set(_re.findall(r"[a-z]+", q_lower)) - write_intents - {"a", "an", "the", "new"}
+        best_match = None
+        for svc in services:
+            for candidate in svc.get("entity_sets", []):
+                candidate_words = set(_re.findall(r"[a-z]+", candidate.lower()))
+                overlap = q_words & candidate_words
+                if overlap and (not best_match or len(overlap) > best_match[0]):
+                    best_match = (len(overlap), svc.get("id"), candidate)
+        if best_match:
+            _, service_id, entity_set = best_match
 
     # Get entity-specific field requirements from metadata
     field_reqs = get_entity_field_requirements(service_id, entity_set)
@@ -2057,6 +2147,56 @@ async def write_execute(payload: ChatRequest, request: Request):
         )
         return {"error": f"Blocked: {guard_result.reason}"}
 
+    def _unwrap_created_record(value):
+        if isinstance(value, dict):
+            if isinstance(value.get("d"), dict):
+                return _unwrap_created_record(value["d"])
+            if isinstance(value.get("value"), dict):
+                return _unwrap_created_record(value["value"])
+            if isinstance(value.get("value"), list) and value["value"]:
+                return _unwrap_created_record(value["value"][0])
+            if isinstance(value.get("results"), list) and value["results"]:
+                return _unwrap_created_record(value["results"][0])
+            return value
+        if isinstance(value, list) and value:
+            return _unwrap_created_record(value[0])
+        return {}
+
+    def _extract_record_id(record):
+        if not isinstance(record, dict):
+            return ""
+        preferred_keys = [
+            entity_set.replace("A_", "").replace("I_", ""),
+            "PurchaseOrder",
+            "OrderID",
+            "ID",
+            "Id",
+            "id",
+            "ObjectID",
+            "UUID",
+        ]
+        for key in preferred_keys:
+            value = record.get(key)
+            if value not in (None, ""):
+                return str(value)
+        for key, value in record.items():
+            key_lower = key.lower()
+            if value not in (None, "") and (key_lower.endswith("id") or key_lower.endswith("uuid")):
+                return str(value)
+        return ""
+
+    def _build_write_table(record):
+        if not isinstance(record, dict) or not record:
+            return None
+        flat_record = {}
+        for key, value in record.items():
+            if key.startswith("__") or isinstance(value, (dict, list)):
+                continue
+            flat_record[key] = value
+        if not flat_record:
+            return None
+        return {"columns": list(flat_record.keys()), "rows": [flat_record], "row_count": 1}
+
     # Execute write
     try:
         svc = service_manager._services.get(service_id, {})
@@ -2080,21 +2220,37 @@ async def write_execute(payload: ChatRequest, request: Request):
 
         # Run output guards
         result = run_output_guards(result, operation)
+        created_record = _unwrap_created_record(result)
+        if operation == "create" and isinstance(created_record, dict):
+            created_record = {**fields, **created_record}
+        created_id = _extract_record_id(created_record)
+        result_table = _build_write_table(created_record)
+        if operation == "create":
+            if created_id:
+                summary = f"Successfully created {entity_set}. New ID: {created_id}"
+            else:
+                summary = f"Successfully created entity in {entity_set}"
+        else:
+            summary = f"Successfully {operation}d entity in {entity_set}"
 
         # Log successful write
         from app.services.guardrails import log_write_operation
         log_write_operation(
             operation=operation, entity_set=entity_set, service_id=service_id,
             user_role=user_role, user_id=payload.session_id or "anonymous",
-            fields=fields, success=True, entity_id=entity_id or "",
+            fields=fields, success=True, entity_id=entity_id or created_id or "",
         )
 
         return {
             "success": True,
             "operation": operation,
             "entity_set": entity_set,
+            "service_id": service_id,
             "result": result,
-            "summary": f"Successfully {operation}d entity in {entity_set}",
+            "created_id": created_id,
+            "created_record": created_record,
+            "table": result_table,
+            "summary": summary,
         }
     except Exception as e:
         logger.exception(f"Write execution failed: {e}")
@@ -2108,35 +2264,75 @@ async def write_execute(payload: ChatRequest, request: Request):
 
 
 @app.get("/sessions", response_model=List[SessionInfo])
-async def get_sessions():
-    return [SessionInfo(**s) for s in list_sessions()]
+async def get_sessions(request: Request):
+    """Return sessions scoped to the logged-in user.
+    Admins (super_admin / admin) see all sessions.
+    """
+    user = get_current_user(request)
+    user_id = user.get("sub") if user else None
+    user_role = user.get("role", "") if user else ""
+    is_admin = user_role in ("super_admin", "admin")
+    return [SessionInfo(**s) for s in list_sessions(user_id=user_id, is_admin=is_admin)]
 
 
 @app.post("/sessions", response_model=SessionInfo)
-async def create_session_endpoint(payload: SessionCreate):
-    sid = create_session(title=payload.title, user_role=payload.user_role)
-    sessions = list_sessions()
-    for s in sessions:
-        if s["id"] == sid:
-            return SessionInfo(**s)
-    raise HTTPException(status_code=500, detail="Failed to create session")
+async def create_session_endpoint(payload: SessionCreate, request: Request):
+    """Create a new session owned by the logged-in user."""
+    user = get_current_user(request)
+    user_id = user.get("sub") if user else None
+    user_role = user.get("role", payload.user_role) if user else payload.user_role
+    sid = create_session(title=payload.title, user_role=user_role, user_id=user_id)
+    session = get_session(sid)
+    if not session:
+        raise HTTPException(status_code=500, detail="Failed to create session")
+    return SessionInfo(**session)
 
 
 @app.patch("/sessions/{session_id}")
-async def patch_session(session_id: str, payload: Dict[str, str]):
+async def patch_session(session_id: str, payload: Dict[str, str], request: Request):
+    """Rename a session. Users can only rename their own; admins can rename any."""
+    user = get_current_user(request)
+    user_id = user.get("sub") if user else None
+    user_role = user.get("role", "") if user else ""
+    is_admin = user_role in ("super_admin", "admin")
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if not is_admin and session.get("user_id") and session["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="You do not own this session")
     if "title" in payload:
         rename_session(session_id, payload["title"])
     return {"ok": True}
 
 
 @app.delete("/sessions/{session_id}")
-async def delete_session_endpoint(session_id: str):
+async def delete_session_endpoint(session_id: str, request: Request):
+    """Delete a session. Users can only delete their own; admins can delete any."""
+    user = get_current_user(request)
+    user_id = user.get("sub") if user else None
+    user_role = user.get("role", "") if user else ""
+    is_admin = user_role in ("super_admin", "admin")
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if not is_admin and session.get("user_id") and session["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="You do not own this session")
     delete_session(session_id)
     return {"deleted": session_id}
 
 
 @app.get("/sessions/{session_id}/messages", response_model=List[MessageInfo])
-async def get_session_messages(session_id: str):
+async def get_session_messages(session_id: str, request: Request):
+    """Return messages for a session. Users can only read their own; admins can read any."""
+    user = get_current_user(request)
+    user_id = user.get("sub") if user else None
+    user_role = user.get("role", "") if user else ""
+    is_admin = user_role in ("super_admin", "admin")
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if not is_admin and session.get("user_id") and session["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="You do not own this session")
     return [MessageInfo(**m) for m in get_messages(session_id)]
 
 
