@@ -330,7 +330,11 @@ class ODataClient:
         count: bool = False,
     ) -> str:
         if self._is_sap_cpi():
-            return self._build_sap_cpi_url(entity_set, top=top)
+            return self._build_sap_cpi_url(
+                entity_set, top=top, select=select,
+                filter_expr=filter_expr, expand=expand,
+                skip=skip, orderby=orderby,
+            )
         params: List[Tuple[str, str]] = []
         if select:
             params.append(("$select", ",".join(select)))
@@ -349,8 +353,15 @@ class ODataClient:
         qs = urlencode(params)
         return f"{self._get_data_base_url()}/{entity_set}{'?' + qs if qs else ''}"
 
-    def _build_sap_cpi_url(self, entity_set: str, top: Optional[int] = None) -> str:
-        """Build SAP CPI data URL: base?service=X&entity=Y&top=N"""
+    def _build_sap_cpi_url(self, entity_set: str, top: Optional[int] = None,
+                           select: Optional[List[str]] = None,
+                           filter_expr: Optional[str] = None,
+                           expand: Optional[List[str]] = None,
+                           skip: Optional[int] = None,
+                           orderby: Optional[str] = None) -> str:
+        """Build SAP CPI data URL: base?service=X&entity=Y&top=N
+        NOTE: SAP CPI proxy only supports service, entity, top.
+        $filter and $orderby are applied client-side after fetch."""
         base = self._get_data_base_url()
         service_name = self._get_sap_service_name()
         params = [("service", service_name), ("entity", entity_set)]
@@ -372,18 +383,159 @@ class ODataClient:
         cached = self._query_cache.get(entity_set, select, filter_expr, expand, top, skip, orderby)
         if cached is not None:
             return cached
-        url = self._build_url(
-            entity_set, select=select, filter_expr=filter_expr,
-            expand=expand, top=top, skip=skip, orderby=orderby, count=True,
-        )
+        # For SAP CPI, filter/orderby must be applied client-side
+        sap_cpi = self._is_sap_cpi()
+        # SAP CPI needs a top limit for valid responses; fetch extra for client-side ops
+        if sap_cpi:
+            extra = 200 if (filter_expr or orderby) else 0
+            fetch_top = min((top or 0) + extra, 50)  # SAP CPI can't handle top > 50
+            url = self._build_sap_cpi_url(entity_set, top=fetch_top)
+        else:
+            fetch_top = top
+            url = self._build_url(
+                entity_set, select=select, filter_expr=filter_expr,
+                expand=expand, top=fetch_top, skip=skip, orderby=orderby, count=True,
+            )
         client = await self._get_client()
         headers = {"Accept": "application/json"}
         headers.update(self._get_auth_headers())
         resp = await client.get(url, headers=headers)
+        # SAP CPI: retry with smaller top on 500
+        if sap_cpi and resp.status_code == 500 and fetch_top > 1:
+            for fallback_top in [5, 2, 1]:
+                if fallback_top >= fetch_top:
+                    continue
+                url_retry = self._build_sap_cpi_url(entity_set, top=fallback_top)
+                resp = await client.get(url_retry, headers=headers)
+                if resp.status_code == 200:
+                    logger.info(f"SAP CPI retry {entity_set}: top={fetch_top} failed, top={fallback_top} succeeded")
+                    fetch_top = fallback_top
+                    break
         resp.raise_for_status()
         data = resp.json()
+        if sap_cpi:
+            data = self._apply_client_side_ops(data, select=select, filter_expr=filter_expr, top=top, skip=skip, orderby=orderby)
         self._query_cache.set(entity_set, select, filter_expr, expand, top, skip, orderby, data)
         return data
+
+    async def get_count(
+        self,
+        entity_set: str,
+        filter_expr: Optional[str] = None,
+    ) -> Optional[int]:
+        """Return the total row count for an entity set.
+
+        Strategy:
+        1. Try ``/EntitySet/$count`` (OData v4 inline count endpoint).
+        2. Try ``/EntitySet?$count=true&$top=0`` and read ``@odata.count``.
+        3. Fall back to a plain fetch with a large top and count rows in Python.
+
+        Returns the count as an int, or None on failure.
+        """
+        if self._is_sap_cpi():
+            # SAP CPI doesn't support $count — fall back to Python count
+            return None
+
+        client = await self._get_client()
+        headers = {"Accept": "application/json"}
+        headers.update(self._get_auth_headers())
+
+        base_data_url = self._get_data_base_url()
+
+        # Strategy 1: /$count path (returns plain integer text)
+        try:
+            count_url = f"{base_data_url}/{entity_set}/$count"
+            if filter_expr:
+                from urllib.parse import urlencode
+                count_url += "?" + urlencode([("$filter", filter_expr)])
+            resp = await client.get(count_url, headers={**headers, "Accept": "text/plain"})
+            if resp.status_code == 200:
+                text = resp.text.strip()
+                if text.isdigit():
+                    logger.debug(f"get_count({entity_set}): /$count returned {text}")
+                    return int(text)
+        except Exception as e:
+            logger.debug(f"get_count({entity_set}): /$count path failed: {e}")
+
+        # Strategy 2: ?$count=true&$top=0
+        try:
+            from urllib.parse import urlencode as _enc
+            params = [("$count", "true"), ("$top", "0")]
+            if filter_expr:
+                params.append(("$filter", filter_expr))
+            count_url2 = f"{base_data_url}/{entity_set}?{_enc(params)}"
+            resp2 = await client.get(count_url2, headers=headers)
+            if resp2.status_code == 200:
+                data2 = resp2.json()
+                cnt = data2.get("@odata.count")
+                if cnt is not None:
+                    logger.debug(f"get_count({entity_set}): $count=true returned {cnt}")
+                    return int(cnt)
+        except Exception as e:
+            logger.debug(f"get_count({entity_set}): $count=true path failed: {e}")
+
+        # Strategy 3: Python-side count from a large fetch
+        try:
+            data3 = await self.query(
+                entity_set=entity_set,
+                filter_expr=filter_expr,
+                top=5000,
+            )
+            rows = self.flatten_odata_value(data3.get("value", []))
+            # Prefer server-reported @odata.count if available
+            server_count = data3.get("@odata.count")
+            result = int(server_count) if server_count is not None else len(rows)
+            logger.debug(f"get_count({entity_set}): Python fallback returned {result}")
+            return result
+        except Exception as e:
+            logger.warning(f"get_count({entity_set}): all strategies failed: {e}")
+            return None
+
+
+
+    def _apply_client_side_ops(self, data: Dict[str, Any], select=None, filter_expr=None,
+                               top=None, skip=None, orderby=None) -> Dict[str, Any]:
+        """Apply $filter, $orderby, $select, $skip, $top client-side for SAP CPI responses."""
+        import re as _re
+        rows = self.flatten_odata_value(data.get("value", data))
+        if not rows:
+            return data
+
+        if filter_expr:
+            and_parts = _re.split(r"\s+and\s+", filter_expr, flags=_re.IGNORECASE)
+            for part in and_parts:
+                m = _re.match(r"(\w+)\s*(eq|ne|gt|ge|lt|le)\s*'?([^']*?)'?$", part.strip(), flags=_re.IGNORECASE)
+                if not m:
+                    continue
+                field, op, val = m.group(1), m.group(2).lower(), m.group(3)
+                filtered = []
+                for row in rows:
+                    # Case-insensitive field lookup
+                    field_key = next((k for k in row if k.lower() == field.lower()), field)
+                    rv = row.get(field_key)
+                    try:
+                        rv_c, val_c = float(rv) if rv is not None else 0, float(val)
+                    except (ValueError, TypeError):
+                        rv_c, val_c = str(rv) if rv is not None else "", val
+                    if (op == "eq" and rv_c == val_c) or (op == "ne" and rv_c != val_c) or \
+                       (op == "gt" and rv_c > val_c) or (op == "ge" and rv_c >= val_c) or \
+                       (op == "lt" and rv_c < val_c) or (op == "le" and rv_c <= val_c):
+                        filtered.append(row)
+                rows = filtered
+
+        if orderby:
+            desc = orderby.strip().endswith("desc")
+            field = orderby.strip().rsplit(" ", 1)[0].strip()
+            rows.sort(key=lambda r: (r.get(field) is None, r.get(field, "")), reverse=desc)
+
+        if skip and skip > 0:
+            rows = rows[skip:]
+        if top is not None:
+            rows = rows[:top]
+        if select:
+            rows = [{k: r.get(next((rk for rk in r if rk.lower() == k.lower()), k)) for k in select} for r in rows]
+
+        return {"value": rows}
 
     async def get_by_id(self, entity_set: str, entity_id: str, select: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         qs = f"?$select={','.join(select)}" if select else ""

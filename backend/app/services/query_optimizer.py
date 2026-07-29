@@ -86,6 +86,23 @@ class QueryOptimizer:
         r"\brank\b",                        # "rank by"
         r"\branking\b",
         r"\bper\s+\w+\b",                  # "per customer" (needs grouping)
+        r"\bcompare\b",                     # "compare X with Y"
+        r"\bcomparing\b",                   # "comparing X to Y"
+        r"\bvs\b",                          # "X vs Y"
+        r"\bversus\b",                      # "X versus Y"
+        r"\bwith\s+\w+\s+from\b",          # "with orders from"
+        r"\band\s+also\b",                  # "and also show"
+        r"\band\s+show\b",                  # "and show"
+        r"\band\s+then\b",                  # "and then show"
+        r"\balso\s+show\b",                 # "also show"
+        r"\balso\s+from\b",                 # "also from"
+        r"\bfrom\s+(?:the\s+)?(?:order|purchase|sales|invoice|delivery)\b",  # "from the order"
+        r"\bfrom\s+(?:the\s+)?(?:order|purchase|sales|invoice|delivery)\s+(?:number|no|#|id)?\s*\S+",  # "from order number 1000025"
+        r"\brelat(?:ed|ing)\s+to\b",        # "related to order"
+        r"\bbelonging\s+to\b",              # "belonging to order"
+        r"\bfor\s+(?:the\s+)?(?:order|purchase|sales|invoice|delivery)\s+(?:number|no|#|id)?\s*\S+",  # "for order 1000025"
+        r"\b(?:show|get|find|list)\s+[\w\s]+?\s+(?:from|in|of|for)\s+(?:the\s+)?(?:order|purchase)\b",  # "show me material from order"
+        r"\b(?:show|get|find|list)\s+[\w\s]+?\s+(?:from|in|of|for)\s+\S+\b.*\b(?:order|purchase|sales)\b",  # "show X from 1000025 order"
     ]
 
     def _is_complex_query(self, q: str) -> bool:

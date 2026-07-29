@@ -4,6 +4,7 @@ Maintains a registry of OData services, their clients, and their metadata.
 Provides discovery, indexing, and dispatch.
 """
 import asyncio
+import re
 from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
 
@@ -29,6 +30,81 @@ class ODataServiceManager:
 
     def graph(self):
         return neo4j_client if neo4j_client.is_available() else get_memory_graph()
+
+    @staticmethod
+    def _coerce_filter_value(raw: str) -> Any:
+        value = raw.strip().strip("'").strip('"')
+        lowered = value.lower()
+        if lowered == "null":
+            return None
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+        if re.fullmatch(r"-?\d+", value):
+            try:
+                return int(value)
+            except ValueError:
+                return value
+        if re.fullmatch(r"-?\d+\.\d+", value):
+            try:
+                return float(value)
+            except ValueError:
+                return value
+        return value
+
+    @classmethod
+    def _matches_simple_filter(cls, row: Dict[str, Any], filter_expr: str) -> bool:
+        if not filter_expr:
+            return True
+
+        def _get_field(row, field):
+            v = row.get(field)
+            if v is not None:
+                return v
+            fl = field.lower()
+            for k in row:
+                if k.lower() == fl:
+                    return row[k]
+            return None
+
+        conditions = [part.strip() for part in re.split(r"\s+and\s+", filter_expr, flags=re.IGNORECASE) if part.strip()]
+        for condition in conditions:
+            contains_match = re.match(r"contains\(([\w]+),\s*'([^']*)'\)", condition, re.IGNORECASE)
+            if contains_match:
+                field, needle = contains_match.groups()
+                actual = _get_field(row, field)
+                if actual is None or needle.lower() not in str(actual).lower():
+                    return False
+                continue
+
+            compare_match = re.match(r"([\w]+)\s+(eq|ne|gt|ge|lt|le)\s+(.+)", condition, re.IGNORECASE)
+            if not compare_match:
+                continue
+
+            field, op, raw_expected = compare_match.groups()
+            actual = _get_field(row, field)
+            expected = cls._coerce_filter_value(raw_expected)
+
+            if op.lower() == "eq" and str(actual) != str(expected):
+                return False
+            if op.lower() == "ne" and str(actual) == str(expected):
+                return False
+            if op.lower() in {"gt", "ge", "lt", "le"}:
+                try:
+                    actual_cmp = float(actual)
+                    expected_cmp = float(expected)
+                except (TypeError, ValueError):
+                    return False
+                if op.lower() == "gt" and not (actual_cmp > expected_cmp):
+                    return False
+                if op.lower() == "ge" and not (actual_cmp >= expected_cmp):
+                    return False
+                if op.lower() == "lt" and not (actual_cmp < expected_cmp):
+                    return False
+                if op.lower() == "le" and not (actual_cmp <= expected_cmp):
+                    return False
+        return True
 
     async def register_service(
         self,
@@ -101,9 +177,9 @@ class ODataServiceManager:
             async with sem:
                 try:
                     if client._is_sap_cpi():
-                        url = client._build_sap_cpi_url(es_name, top=1)
+                        url = client._build_sap_cpi_url(es_name, top=5)
                     else:
-                        url = f"{svc['base_url']}/{es_name}?$top=1"
+                        url = f"{svc['base_url']}/{es_name}?$top=5"
                     headers = client._get_auth_headers()
                     resp = await http_client.get(url, headers=headers, timeout=15)
                     healthy[es_name] = resp.status_code == 200
@@ -459,6 +535,15 @@ class ODataServiceManager:
         for r in rows:
             if isinstance(r, dict):
                 cleaned_rows.append({k: v for k, v in r.items() if k != "@odata.etag"})
+
+        filter_expr = plan.get("filter")
+        # Skip second filter for SAP CPI — already applied client-side in odata_client._apply_client_side_ops
+        is_sap_cpi = client._is_sap_cpi() if hasattr(client, '_is_sap_cpi') else False
+        if filter_expr and cleaned_rows and not is_sap_cpi:
+            locally_filtered = [r for r in cleaned_rows if self._matches_simple_filter(r, filter_expr)]
+            if len(locally_filtered) != len(cleaned_rows):
+                cleaned_rows = locally_filtered
+                total_count = len(cleaned_rows)
 
         columns = []
         for r in cleaned_rows:

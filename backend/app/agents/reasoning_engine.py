@@ -124,7 +124,8 @@ class LLMReasoningEngine:
         """Return (service_id, entity_set) when the query contains an exact entity set name."""
         q = query.lower()
         q_compact = re.sub(r"[^a-z0-9]", "", q)
-        matches: List[Tuple[int, str, str]] = []
+        healthy_matches: List[Tuple[int, str, str]] = []
+        unhealthy_matches: List[Tuple[int, str, str]] = []
 
         def entity_search_forms(entity_name: str) -> List[str]:
             forms = {entity_name.lower()}
@@ -141,6 +142,7 @@ class LLMReasoningEngine:
             return [f for f in forms if f]
 
         for svc in services:
+            unhealthy = set(svc.get("unhealthy_entity_sets") or [])
             for entity in svc.get("entity_sets", []):
                 entity_lower = entity.lower()
                 entity_compact = re.sub(r"[^a-z0-9]", "", entity_lower)
@@ -149,7 +151,18 @@ class LLMReasoningEngine:
                 forms = entity_search_forms(entity)
                 compact_forms = [re.sub(r"[^a-z0-9]", "", f) for f in forms]
                 if any(f in q for f in forms) or any(cf and cf in q_compact for cf in compact_forms):
-                    matches.append((len(entity_compact), svc["id"], entity))
+                    score = len(entity_compact)
+                    for cf in compact_forms:
+                        if cf and cf == q_compact:
+                            score += 1000
+                        elif cf and len(cf) > 3 and cf in q_compact:
+                            score += len(cf)
+                    if entity in unhealthy:
+                        unhealthy_matches.append((score, svc["id"], entity))
+                    else:
+                        healthy_matches.append((score, svc["id"], entity))
+        # Prefer healthy matches, but fall back to unhealthy if no healthy match found
+        matches = healthy_matches or unhealthy_matches
         if not matches:
             return None
         matches.sort(reverse=True)
@@ -182,7 +195,10 @@ class LLMReasoningEngine:
         for svc in services:
             labels = svc.get("entity_labels", {})
             props_by_entity = svc.get("entity_properties", {})
+            unhealthy = set(svc.get("unhealthy_entity_sets") or [])
             for entity in svc.get("entity_sets", []):
+                if entity in unhealthy:
+                    continue
                 words = split_entity(entity)
                 if not words:
                     continue
@@ -290,19 +306,27 @@ class LLMReasoningEngine:
         query: str,
         available_services: List[Dict[str, Any]],
         memory_context: Optional[List[Dict[str, Any]]] = None,
+        chat_history: Optional[List[Dict[str, Any]]] = None,
+        session_context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         query = self._normalize_query_typos(query)
-        exact_entity = self._detect_exact_entity(available_services, query)
+        is_complex = self.optimizer._is_complex_query(query.lower())
+        is_write = bool(re.search(r"\b(create|add|new|insert|update|modify|change|delete|remove|edit|set|replace)\b", query.lower()))
+        has_filter_or_id = bool(re.search(r'(\b(where|for|from|with|in|having|filter|equal|greater|less|like)\b|\b(number|no|#|id)\b|\b[a-zA-Z]+\s*[:=]\s*|\b\d{3,}\b)', query.lower()))
+        exact_entity = self._detect_exact_entity(available_services, query) if not is_complex and not is_write else None
         if exact_entity:
             service_id, entity_set = exact_entity
             svc = next((s for s in available_services if s["id"] == service_id), None)
             metadata_xml = svc.get("metadata_xml", "") if svc else ""
+            # Get candidate properties for column matching
+            candidate_props = svc.get("entity_properties", {}).get(entity_set, []) if svc else []
             select, expand, filter_expr, orderby, top = self._build_query_parts(
                 query.lower(),
                 entity_set,
-                [],
+                candidate_props,
                 service_id=service_id,
                 metadata_xml=metadata_xml,
+                session_context=session_context,
             )
             if top is None:
                 top = 20
@@ -328,7 +352,7 @@ class LLMReasoningEngine:
             logger.info(f"Exact entity detected: {service_id}/{entity_set}; skipping LLM")
             return plan, {"provider": "entity-match", "latency_ms": 0, "tokens": 0, "intent": plan["intent"]}
 
-        explicit_service = self._detect_explicit_service(available_services, query.lower())
+        explicit_service = self._detect_explicit_service(available_services, query.lower()) if not is_complex else None
         if explicit_service:
             filtered = [s for s in available_services if s["id"] == explicit_service]
             logger.info(f"Explicit service detected: {explicit_service} — calling LLM with filtered services")
@@ -361,7 +385,7 @@ class LLMReasoningEngine:
         if self.provider == "openai" and settings.openai_api_key:
             t0 = time.perf_counter()
             try:
-                plan, tokens = await self._plan_openai(query, filtered, memory_context)
+                plan, tokens = await self._plan_openai(query, filtered, memory_context, session_context=session_context, chat_history=chat_history)
                 plan = self.optimizer.optimize_plan(plan, query)
                 self.optimizer.cache_plan(query, service_ids, plan)
                 return plan, {"provider": "openai", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": tokens, "intent": intent}
@@ -370,7 +394,7 @@ class LLMReasoningEngine:
         elif self.provider == "openrouter" and settings.openrouter_api_key:
             t0 = time.perf_counter()
             try:
-                plan, tokens = await self._plan_openrouter(query, filtered, memory_context)
+                plan, tokens = await self._plan_openrouter(query, filtered, memory_context, session_context=session_context, chat_history=chat_history)
                 plan = self.optimizer.optimize_plan(plan, query)
                 self.optimizer.cache_plan(query, service_ids, plan)
                 return plan, {"provider": "openrouter", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": tokens, "intent": intent}
@@ -445,11 +469,16 @@ class LLMReasoningEngine:
         query: str,
         services: List[Dict[str, Any]],
         memory_context: Optional[List[Dict[str, Any]]] = None,
+        session_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         q = query.lower()
         intent = self._infer_intent(q)
-        chosen_service = self._pick_service(services, q)
-        entity_set, candidate_properties = self._pick_entity_set(services, chosen_service, q)
+        fallback_svc = session_context.get("last_service_id") if session_context else None
+        fallback_ent = session_context.get("last_entity_set") if session_context else None
+        chosen_service = self._pick_service(services, q) or fallback_svc
+        entity_set, candidate_properties = self._pick_entity_set(
+            services, chosen_service, q, fallback_entity=fallback_ent
+        )
 
         # Extract metadata XML for column priority parsing
         metadata_xml = ""
@@ -530,7 +559,13 @@ class LLMReasoningEngine:
                     return svc["id"]
         return services[0]["id"]
 
-    def _pick_entity_set(self, services: List[Dict[str, Any]], service_id: Optional[str], q: str):
+    def _pick_entity_set(
+        self,
+        services: List[Dict[str, Any]],
+        service_id: Optional[str],
+        q: str,
+        fallback_entity: Optional[str] = None,
+    ):
         svc = next((s for s in services if s["id"] == service_id), None)
         if not svc:
             return None, []
@@ -638,6 +673,11 @@ class LLMReasoningEngine:
             if es_spaced in qn or es.lower() in qn:
                 return es, []
 
+        # Session context fallback: if user provided no entity name, use previous turn's entity set
+        if fallback_entity and fallback_entity in available_entities:
+            logger.info(f"Session context fallback entity used: {fallback_entity}")
+            return fallback_entity, []
+
         return available_entities[0], []
 
     def _pick_analytics_entity(self, svc: Dict[str, Any], qn: str):
@@ -682,7 +722,8 @@ class LLMReasoningEngine:
         return None
 
     def _build_query_parts(self, q: str, entity_set: Optional[str], candidate_properties: List[str],
-                           service_id: str = "", metadata_xml: str = ""):
+                           service_id: str = "", metadata_xml: str = "",
+                           session_context: Optional[Dict[str, Any]] = None):
         select: List[str] = []
         expand: List[str] = []
         filter_expr: Optional[str] = None
@@ -695,39 +736,74 @@ class LLMReasoningEngine:
         m = re.search(r"\bfirst\s+(\d+)\b", q)
         if m and top is None:
             top = int(m.group(1))
+        m = re.search(r"\b(?:latest|newest|recent)\s+(\d+)\b", q)
+        if m and top is None:
+            top = int(m.group(1))
         if top is None and any(w in q.split() for w in ["all", "every"]):
             top = 100
 
+        # "show all" / "list all" — return all columns, skip column selection
+        _wants_all_cols = bool(re.match(r"^(?:show|list|get|display|fetch)\s+(?:me\s+)?(?:all\s+)", q, re.IGNORECASE))
+
+        # "show <entity> where..." — return all columns of that entity with filter
+        _show_entity_filtered = False
+        if entity_set:
+            # Check if query starts with "show <entity_set>" followed by filter
+            _entity_prefix = rf"^(?:show|list|get|display|fetch)\s+(?:me\s+)?(?:the\s+)?{re.escape(entity_set)}\b"
+            if re.search(_entity_prefix, q, re.IGNORECASE):
+                _show_entity_filtered = True
+                logger.debug(f"_build_query_parts: 'show {entity_set} where' detected, returning all columns")
+
         # Two-pass column selection using priority map
-        if candidate_properties:
+        # First check if the user explicitly named specific columns
+        _explicit_col_select: List[str] = []
+        if not _wants_all_cols and not _show_entity_filtered:
             try:
-                from app.services.column_priority import get_top_columns, log_field_selection
-                top_columns = get_top_columns(
-                    entity_set_name=entity_set or "",
-                    service_id=service_id,
-                    all_fields=candidate_properties,
-                    metadata_xml=metadata_xml,
-                    max_columns=20,
-                )
-                if top_columns:
-                    select = top_columns
-                    log_field_selection(
-                        entity_set=entity_set or "",
-                        service_id=service_id,
-                        query=q,
-                        selected_fields=select,
-                        total_fields=len(candidate_properties),
-                    )
-                else:
-                    select = self._pick_smart_columns(q, candidate_properties)
-            except Exception as e:
-                logger.warning(f"Column priority failed, falling back to smart columns: {e}")
-                select = self._pick_smart_columns(q, candidate_properties)
+                from app.services.query_intent_detector import detect_query_intent
+                _col_intent = detect_query_intent(q, candidate_properties)
+                if _col_intent.get("type") == "column_select" and _col_intent.get("columns"):
+                    _explicit_col_select = _col_intent["columns"]
+            except Exception:
+                pass
+
+        if _wants_all_cols or _show_entity_filtered:
+            # User wants all columns — leave select empty (means fetch all)
+            select = []
+            logger.debug(f"_build_query_parts: returning all columns (wants_all={_wants_all_cols}, show_entity_filtered={_show_entity_filtered})")
+        elif _explicit_col_select:
+            # User asked for specific columns — use them directly
+            select = _explicit_col_select
+            logger.debug(f"_build_query_parts: explicit column select={select}")
+        elif session_context and session_context.get("last_entity_set") == entity_set and session_context.get("last_columns"):
+            # Follow-up query on same entity — inherit columns from previous query
+            prev_cols = session_context["last_columns"]
+            # Only inherit columns that exist in current entity
+            select = [c for c in prev_cols if c in candidate_properties] if candidate_properties else prev_cols
+            logger.debug(f"_build_query_parts: inherited columns from context={select}")
+        elif candidate_properties:
+            # No explicit columns requested — return all columns
+            select = []
+            logger.debug("_build_query_parts: no explicit columns requested, returning all columns")
+
 
         explicit_filters: List[str] = []
-        m = re.search(r"\bwhere\s+([\w'\".= ]+?)(?:\s+(?:and|order|by|with|including|limit|top)\b|$)", q)
+        filtered_fields = set()
+        m = re.search(r"\bwhere\s+(.+?)(?=\s+(?:order\s+by|sort\s+by|with|including|limit|top|select)\b|$)", q, re.IGNORECASE)
         if m:
-            explicit_filters.append(self._translate_filter(m.group(1).strip()))
+            where_text = m.group(1).strip()
+            translated_conditions = []
+            for raw_condition in re.split(r"\s+\band\b\s+", where_text, flags=re.IGNORECASE):
+                condition = raw_condition.strip(" ,")
+                if not condition:
+                    continue
+                translated = self._translate_filter(condition)
+                if translated:
+                    translated_conditions.append(translated)
+            explicit_filters.extend(translated_conditions)
+            if "price" in where_text.lower():
+                filtered_fields.add("UnitPrice")
+            if "stock" in where_text.lower():
+                filtered_fields.add("UnitsInStock")
         m = re.search(r"\bfrom\s+([A-Z][\w\s]+?)(?:\s+(?:with|and|order|by|where|top|limit|in)\b|$)", q)
         if m:
             country = m.group(1).strip()
@@ -740,20 +816,81 @@ class LLMReasoningEngine:
             explicit_filters.append("ShippedDate ne null")
         if re.search(r"\bunshipped\b|\bnot\s+shipped\b", q):
             explicit_filters.append("ShippedDate eq null")
+        # Price filters (symbolic: price>20)
         m = re.search(r"(?:price|amount|total)\s*(>|>=|<|<=)\s*(\d+(?:\.\d+)?)", q)
-        if m:
+        if m and "UnitPrice" not in filtered_fields:
             explicit_filters.append(f"UnitPrice {m.group(1)} {m.group(2)}")
+            filtered_fields.add("UnitPrice")
+        # Price filters (natural language: "price is greater than 20")
+        m = re.search(r"(?:unit\s+)?price\s+is\s+(?:greater|more|higher)\s+than\s+(\d+(?:\.\d+)?)", q, re.IGNORECASE)
+        if m and "UnitPrice" not in filtered_fields:
+            explicit_filters.append(f"UnitPrice gt {m.group(1)}")
+            filtered_fields.add("UnitPrice")
+        m = re.search(r"(?:unit\s+)?price\s+is\s+(?:less|lower|smaller)\s+than\s+(\d+(?:\.\d+)?)", q, re.IGNORECASE)
+        if m and "UnitPrice" not in filtered_fields:
+            explicit_filters.append(f"UnitPrice lt {m.group(1)}")
+            filtered_fields.add("UnitPrice")
+        # Stock filters
+        m = re.search(r"stock\s+is\s+(?:less|lower|smaller)\s+than\s+(\d+)", q, re.IGNORECASE)
+        if m and "UnitsInStock" not in filtered_fields:
+            explicit_filters.append(f"UnitsInStock lt {m.group(1)}")
+            filtered_fields.add("UnitsInStock")
+        m = re.search(r"stock\s+is\s+(?:greater|more|higher)\s+than\s+(\d+)", q, re.IGNORECASE)
+        if m and "UnitsInStock" not in filtered_fields:
+            explicit_filters.append(f"UnitsInStock gt {m.group(1)}")
+            filtered_fields.add("UnitsInStock")
+
+        # Document / Order number filter extraction (e.g. "from the order number 1000025", "for order 1000025", "order 1000025")
+        m_ord = re.search(r'\b(?:order|purchase\s+order|manufacturing\s+order|mfg\s+order)\s+(?:number|no|#|id)?\s*[:=]?\s*[\'"]?(\w+)[\'"]?', q, re.IGNORECASE)
+        if not m_ord:
+            m_ord = re.search(r'\b(?:from|for|in|with|of)\s+(?:the\s+)?(?:order|purchase\s+order|manufacturing\s+order)\s+(?:number|no|#|id)?\s*[:=]?\s*[\'"]?(\w+)[\'"]?', q, re.IGNORECASE)
+        if m_ord:
+            ord_val = m_ord.group(1).strip()
+            ord_col = None
+            if candidate_properties:
+                for col in candidate_properties:
+                    cl = col.lower()
+                    if cl in ("manufacturingorder", "mfgorder", "orderid", "orderno", "purchaseorder", "salesorder", "order"):
+                        ord_col = col
+                        break
+                if not ord_col:
+                    for col in candidate_properties:
+                        cl = col.lower()
+                        if "order" in cl and not any(cl.endswith(suffix) for suffix in ("type", "date", "status", "count", "text", "name")):
+                            ord_col = col
+                            break
+            if not ord_col:
+                ord_col = "ManufacturingOrder" if "mpe" in service_id or "mfg" in service_id else "OrderID"
+            if ord_col not in filtered_fields:
+                explicit_filters.append(f"{ord_col} eq '{ord_val}'")
+                filtered_fields.add(ord_col)
+
         if explicit_filters:
             filter_expr = " and ".join(explicit_filters)
 
         m = re.search(r"\border\s+by\s+([\w]+)(?:\s+(asc|desc))?\b", q)
         if m:
             orderby = f"{m.group(1)} {m.group(2) or 'asc'}"
+        m = re.search(r"\bsort\s+by\s+([\w]+)(?:\s+(ascending|descending|asc|desc))?\b", q)
+        if m:
+            direction = (m.group(2) or "asc").lower()
+            if direction == "ascending":
+                direction = "asc"
+            elif direction == "descending":
+                direction = "desc"
+            orderby = f"{m.group(1)} {direction}"
         if not orderby and entity_set in ("Products", "Order_Details", "Order_Details_Extendeds", "Invoices"):
             if any(w in q for w in ["expensive", "highest", "most", "priciest"]):
                 orderby = "UnitPrice desc"
             elif any(w in q for w in ["cheapest", "lowest"]):
                 orderby = "UnitPrice asc"
+        if not orderby and entity_set and "PurchaseOrder" in entity_set:
+            if any(w in q for w in ["expensive", "highest", "most", "priciest", "largest", "biggest"]):
+                orderby = "GrossAmount desc"
+            elif any(w in q for w in ["cheapest", "lowest", "smallest"]):
+                orderby = "GrossAmount asc"
+            elif any(w in q for w in ["recent", "latest", "newest"]):
+                orderby = "CreationDate desc"
         if not orderby and entity_set == "Orders" and any(w in q for w in ["recent", "latest", "newest"]):
             orderby = "OrderDate desc"
         if not orderby and entity_set == "Orders" and any(w in q for w in ["oldest"]):
@@ -791,6 +928,39 @@ class LLMReasoningEngine:
         return select, list(dict.fromkeys(expand)), filter_expr, orderby, top
 
     def _translate_filter(self, raw: str) -> str:
+        raw = raw.strip().strip(",")
+        # NL comparisons FIRST (before generic "is" which is too greedy)
+        m = re.match(r"([\w\s]+?)\s+is\s+(?:greater|more|higher|bigger)\s+than\s+([\d.]+)", raw, re.IGNORECASE)
+        if m:
+            field = m.group(1).strip().replace(" ", "")
+            return f"{field} gt {m.group(2)}"
+        m = re.match(r"([\w\s]+?)\s+is\s+(?:less|lower|smaller|fewer)\s+than\s+([\d.]+)", raw, re.IGNORECASE)
+        if m:
+            field = m.group(1).strip().replace(" ", "")
+            return f"{field} lt {m.group(2)}"
+        m = re.match(r"([\w\s]+?)\s+is\s+(?:greater|more|higher)\s+than\s+or\s+equal\s+(?:to\s+)?([\d.]+)", raw, re.IGNORECASE)
+        if m:
+            field = m.group(1).strip().replace(" ", "")
+            return f"{field} ge {m.group(2)}"
+        m = re.match(r"([\w\s]+?)\s+is\s+(?:less|lower|smaller)\s+than\s+or\s+equal\s+(?:to\s+)?([\d.]+)", raw, re.IGNORECASE)
+        if m:
+            field = m.group(1).strip().replace(" ", "")
+            return f"{field} le {m.group(2)}"
+        # Symbolic comparisons: "price>20", "amount>=100"
+        m = re.match(r"([\w]+)\s*(>|>=|<|<=)\s*([\d.]+)", raw)
+        if m:
+            op_map = {">": "gt", ">=": "ge", "<": "lt", "<=": "le"}
+            return f"{m.group(1)} {op_map[m.group(2)]} {m.group(3)}"
+        # Generic "is" patterns (must be after comparisons)
+        m = re.match(r"([\w]+)\s+is\s+'([^']*)'", raw, re.IGNORECASE)
+        if m:
+            return f"{m.group(1)} eq '{m.group(2)}'"
+        m = re.match(r"([\w]+)\s+is\s+([\w\d\.\-]+)", raw, re.IGNORECASE)
+        if m:
+            v = m.group(2)
+            if v.replace(".", "").replace("-", "").isdigit():
+                return f"{m.group(1)} eq {v}"
+            return f"{m.group(1)} eq '{v}'"
         m = re.match(r"([\w]+)\s*=\s*'([^']*)'", raw)
         if m:
             return f"{m.group(1)} eq '{m.group(2)}'"
@@ -800,6 +970,9 @@ class LLMReasoningEngine:
             if v.replace(".", "").replace("-", "").isdigit():
                 return f"{m.group(1)} eq {v}"
             return f"{m.group(1)} eq '{v}'"
+        m = re.match(r"([\w]+)\s+contains\s+([\w\s\.-]+)", raw, re.IGNORECASE)
+        if m:
+            return f"contains({m.group(1)}, '{m.group(2).strip()}')"
         m = re.match(r"([\w]+)\s+contains\s+'([^']*)'", raw)
         if m:
             return f"contains({m.group(1)},'{m.group(2)}')"
@@ -871,6 +1044,8 @@ class LLMReasoningEngine:
         query: str,
         services: List[Dict[str, Any]],
         memory_context: Optional[List[Dict[str, Any]]] = None,
+        session_context: Optional[Dict[str, Any]] = None,
+        chat_history: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[Dict[str, Any], int]:
         from openai import AsyncOpenAI
 
@@ -922,6 +1097,17 @@ class LLMReasoningEngine:
             "services": filtered_services,
             "entity_suggestions": suggestions,
         }
+        if session_context and session_context.get("last_entity_set"):
+            user_prompt_data["previous_context"] = {
+                "last_entity_set": session_context.get("last_entity_set"),
+                "last_service_id": session_context.get("last_service_id"),
+                "last_columns": session_context.get("last_columns"),
+            }
+        if chat_history:
+            user_prompt_data["chat_history"] = chat_history[-6:]
+        _summary = session_context.get("summary", "") if session_context else ""
+        if _summary:
+            user_prompt_data["conversation_summary"] = _summary
         if rag_examples:
             user_prompt_data["similar_past_queries"] = [
                 {"query": ex["query"], "plan": ex["plan"]} for ex in rag_examples[:3]
@@ -970,6 +1156,8 @@ class LLMReasoningEngine:
         query: str,
         services: List[Dict[str, Any]],
         memory_context: Optional[List[Dict[str, Any]]] = None,
+        session_context: Optional[Dict[str, Any]] = None,
+        chat_history: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[Dict[str, Any], int]:
         from openai import AsyncOpenAI
 
@@ -987,6 +1175,8 @@ class LLMReasoningEngine:
             "Use entity_suggestions — they are pre-scored. Only deviate if clearly wrong. "
             "AVOID entities ending in VH, StdVH, ValueHelp — these are SAP dropdown metadata, not real data. "
             "If similar_past_queries are provided, use them as reference for correct entity/filter patterns. "
+            "If previous_context is provided, the user may be referring to the same entity or service. "
+            "If chat_history is provided, consider the conversation context to resolve ambiguous references like 'it', 'them', 'those', 'the same'. "
             "For 'top N X by Y count/total' queries: create 2 steps — one per entity needed. The backend joins them in Python. "
             "Example: 'top 5 customers by order count' → step1: Customers (top=200), step2: Orders (top=200). "
             "OData does NOT support JOINs/GROUP BY — backend does aggregation in Python. "
@@ -1004,11 +1194,24 @@ class LLMReasoningEngine:
             elif len(s.get("entity_sets", [])) <= 10:
                 filtered_services.append(self._truncate_service_for_llm(s))
 
-        user_prompt = json.dumps({
+        user_prompt_data = {
             "query": query,
             "services": filtered_services,
             "entity_suggestions": suggestions,
-        })
+        }
+        if session_context and session_context.get("last_entity_set"):
+            user_prompt_data["previous_context"] = {
+                "last_entity_set": session_context.get("last_entity_set"),
+                "last_service_id": session_context.get("last_service_id"),
+                "last_columns": session_context.get("last_columns"),
+            }
+        if chat_history:
+            user_prompt_data["chat_history"] = chat_history[-6:]
+        _summary_or = session_context.get("summary", "") if session_context else ""
+        if _summary_or:
+            user_prompt_data["conversation_summary"] = _summary_or
+
+        user_prompt = json.dumps(user_prompt_data)
 
         client = AsyncOpenAI(
             api_key=settings.openrouter_api_key,
@@ -1022,7 +1225,7 @@ class LLMReasoningEngine:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            max_tokens=2048,
+            max_tokens=1024,
             response_format={"type": "json_object"},
         )
         content = resp.choices[0].message.content
@@ -1069,7 +1272,7 @@ class LLMReasoningEngine:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            max_tokens=2048,
+            max_tokens=1024,
             response_format={"type": "json_object"},
         )
         content = resp.choices[0].message.content
@@ -1388,12 +1591,23 @@ class LLMReasoningEngine:
                 return await self._generate_openai(system_prompt, user_prompt, temperature, max_tokens)
             except Exception as e:
                 logger.warning(f"OpenAI generate failed: {e}")
+        elif self.provider == "openrouter" and settings.openrouter_api_key:
+            try:
+                return await self._generate_openrouter(system_prompt, user_prompt, temperature, max_tokens)
+            except Exception as e:
+                logger.warning(f"OpenRouter generate failed: {e}")
+        elif self.provider == "nvidia" and settings.nvidia_api_key:
+            try:
+                return await self._generate_nvidia(system_prompt, user_prompt, temperature, max_tokens)
+            except Exception as e:
+                logger.warning(f"NVIDIA generate failed: {e}")
         elif self.provider == "gemini" and settings.gemini_api_key:
             try:
                 return await self._generate_gemini(system_prompt, user_prompt, temperature, max_tokens)
             except Exception as e:
                 logger.warning(f"Gemini generate failed: {e}")
         return {"content": f"[Mock LLM] {user_prompt[:200]}", "provider": "mock", "tokens": 0}
+
 
     async def _generate_openai(self, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int) -> Dict[str, Any]:
         import httpx
@@ -1411,12 +1625,63 @@ class LLMReasoningEngine:
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(f"{base_url}/chat/completions", headers=headers, json=body)
             if resp.status_code != 200:
-                logger.error(f"Groq API error {resp.status_code}: {resp.text[:500]}")
+                logger.error(f"OpenAI API error {resp.status_code}: {resp.text[:500]}")
                 resp.raise_for_status()
             data = resp.json()
             content = data["choices"][0]["message"]["content"]
             tokens = data.get("usage", {}).get("total_tokens", 0)
-            return {"content": content, "provider": "groq", "tokens": tokens}
+            return {"content": content, "provider": "openai", "tokens": tokens}
+
+    async def _generate_openrouter(self, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int) -> Dict[str, Any]:
+        import httpx
+        headers = {
+            "Authorization": f"Bearer {settings.openrouter_api_key}",
+            "HTTP-Referer": "http://localhost:8000",
+            "Content-Type": "application/json"
+        }
+        body = {
+            "model": self.model or settings.openrouter_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        base_url = (settings.openrouter_base_url or "https://openrouter.ai/api/v1").rstrip("/")
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(f"{base_url}/chat/completions", headers=headers, json=body)
+            if resp.status_code != 200:
+                logger.error(f"OpenRouter API error {resp.status_code}: {resp.text[:500]}")
+                resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            tokens = data.get("usage", {}).get("total_tokens", 0)
+            return {"content": content, "provider": "openrouter", "tokens": tokens}
+
+    async def _generate_nvidia(self, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int) -> Dict[str, Any]:
+        import httpx
+        headers = {"Authorization": f"Bearer {settings.nvidia_api_key}", "Content-Type": "application/json"}
+        body = {
+            "model": self.model or settings.nvidia_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        base_url = (settings.nvidia_base_url or "https://integrate.api.nvidia.com/v1").rstrip("/")
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(f"{base_url}/chat/completions", headers=headers, json=body)
+            if resp.status_code != 200:
+                logger.error(f"NVIDIA API error {resp.status_code}: {resp.text[:500]}")
+                resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            tokens = data.get("usage", {}).get("total_tokens", 0)
+            return {"content": content, "provider": "nvidia", "tokens": tokens}
+
 
     async def _generate_gemini(self, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int) -> Dict[str, Any]:
         from google import genai

@@ -69,6 +69,8 @@ EMPTY_OR_DEFAULT_VALUES = {
     "0.00",
     "000000000000000000000000000000",
     "1970-01-01T00:00:00.000",
+    "1970-01-01",
+    "0001-01-01T00:00:00",
 }
 
 EMPTY_VALUES = {
@@ -79,6 +81,12 @@ EMPTY_VALUES = {
     "null",
     "NaN",
     "nan",
+    "0",
+    "0.0",
+    "0.00",
+    "1970-01-01T00:00:00.000",
+    "1970-01-01",
+    "0001-01-01T00:00:00",
 }
 
 SMALL_RESULT_ROW_COUNT = 20
@@ -98,15 +106,22 @@ def is_business_column(col_name: str, column_labels: Dict[str, str] = None) -> b
 
 def is_useless_column(col_name: str, rows: List[Dict[str, Any]], threshold: float = 0.95, small_result: bool = False) -> bool:
     """Return True if a column is empty/default or same value in most rows.
-    For small results, only hide truly empty columns (not constant-value ones)."""
+    For small results, use a lower threshold (80%) to catch mostly-empty columns."""
     if not rows:
         return False
 
     total = len(rows)
-    values = [str(row.get(col_name, "")).strip() for row in rows]
+    values = []
+    for row in rows:
+        val = row.get(col_name)
+        if val is None:
+            values.append("")
+        else:
+            values.append(str(val).strip())
 
+    effective_threshold = 0.80 if small_result else threshold
     empty_count = sum(1 for v in values if v in EMPTY_OR_DEFAULT_VALUES)
-    if empty_count / total >= threshold:
+    if empty_count / total >= effective_threshold:
         return True
 
     if not small_result and len(set(values)) <= 1:
@@ -119,8 +134,14 @@ def is_empty_column(col_name: str, rows: List[Dict[str, Any]]) -> bool:
     """Return True when every returned row is blank/null for this column."""
     if not rows:
         return False
-    values = [str(row.get(col_name, "")).strip() for row in rows]
-    return all(v in EMPTY_VALUES for v in values)
+    for row in rows:
+        val = row.get(col_name)
+        if val is None:
+            continue
+        s = str(val).strip()
+        if s not in EMPTY_VALUES:
+            return False
+    return True
 
 
 def hidden_reason(col_name: str, rows: List[Dict[str, Any]]) -> str:
@@ -129,14 +150,21 @@ def hidden_reason(col_name: str, rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return "filtered"
 
-    values = [str(row.get(col_name, "")).strip() for row in rows]
+    values = []
+    for row in rows:
+        val = row.get(col_name)
+        if val is None:
+            values.append("")
+        else:
+            values.append(str(val).strip())
+
     if all(v in EMPTY_VALUES for v in values):
         return "empty/null in result set"
     if len(set(values)) <= 1:
         return "same value in result set"
 
     empty_count = sum(1 for v in values if v in EMPTY_OR_DEFAULT_VALUES)
-    if empty_count / len(rows) >= 0.95:
+    if empty_count / len(rows) >= 0.80:
         return "mostly empty/default values"
     return "filtered"
 
@@ -189,6 +217,7 @@ def filter_columns(
     user_hidden: Set[str] = None,
     keep_hints: List[str] = None,
     column_priorities: Optional[List[Dict[str, Any]]] = None,
+    show_all: bool = False,
 ) -> Dict[str, Any]:
     """Filter and priority-sort a table's columns.
 
@@ -228,7 +257,7 @@ def filter_columns(
         if col in keep_hints or is_business_column(col, column_labels):
             keep_cols.append(col)
             continue
-        if not small_result and is_useless_column(col, rows, small_result=small_result):
+        if not show_all and not small_result and is_useless_column(col, rows, small_result=small_result):
             hidden_columns.append({"name": col, "reason": hidden_reason(col, rows)})
             continue
         keep_cols.append(col)

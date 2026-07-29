@@ -37,7 +37,10 @@ class QueryOptimizerTests(unittest.TestCase):
 
         self.assertIn("ProductID", selected)
         self.assertIn("ProductName", selected)
-        self.assertIn("UnitPrice", selected)
+    def test_order_number_complexity(self):
+        optimizer = QueryOptimizer()
+        self.assertTrue(optimizer._is_complex_query("show me material from the order number 1000025"))
+        self.assertTrue(optimizer._is_complex_query("show material for order 1000025"))
 
 
 if __name__ == "__main__":

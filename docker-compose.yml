@@ -36,7 +36,7 @@ services:
       SQLITE_DB_PATH: /app/data/app.db
       APP_HOST: 0.0.0.0
       APP_PORT: "8000"
-      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openrouter}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_API_KEYS: ${OPENAI_API_KEYS:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.groq.com/openai/v1}
@@ -105,9 +105,9 @@ services:
     container_name: odata-n8n
     restart: unless-stopped
     environment:
-      - N8N_BASIC_AUTH_ACTIVE=true
-      - N8N_BASIC_AUTH_USER=admin
-      - N8N_BASIC_AUTH_PASSWORD=admin
+      - N8N_BASIC_AUTH_ACTIVE=${N8N_BASIC_AUTH_ACTIVE:-true}
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER:-admin}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD:-admin}
       - N8N_HOST=localhost
       - N8N_PORT=5678
       - N8N_PROTOCOL=http
@@ -126,7 +126,7 @@ services:
       - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
       - N8N_INTEGRATION_TOKEN=${N8N_INTEGRATION_TOKEN:-}
       - TEAMS_WEBHOOK_URL=${TEAMS_WEBHOOK_URL:-}
-      - N8N_API_KEY=n8n-api-key-f4653661832cdd536d28b62539f9b7db5b76f20f395dc867f3a8c90c924f9f71
+      - N8N_API_KEY=${N8N_API_KEY:-}
       - N8N_PUBLIC_API_ENABLED=true
     ports:
       - "5678:5678"

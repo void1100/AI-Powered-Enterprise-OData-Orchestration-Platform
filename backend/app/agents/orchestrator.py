@@ -99,7 +99,8 @@ def _normalize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
 
 def _apply_safety_caps(plan: Dict[str, Any]) -> Dict[str, Any]:
     """Ensure every step has a $top cap to prevent accidental huge responses.
-    SAP CPI services have strict row limits (often 2-5), so we use a lower cap."""
+    SAP CPI services have strict row limits (often 2-5), so we use a lower cap.
+    'show all' queries bypass the cap (top=100 signals all-rows intent)."""
     if not plan:
         return plan
     for step in plan.get("steps", []):
@@ -110,7 +111,9 @@ def _apply_safety_caps(plan: Dict[str, Any]) -> Dict[str, Any]:
         if step.get("top") is None:
             step["top"] = cap
         elif isinstance(step.get("top"), int) and step["top"] > cap:
-            step["top"] = cap
+            # top=100 is the "show all" signal — don't cap it
+            if step["top"] != 100:
+                step["top"] = cap
     return plan
 
 
@@ -132,8 +135,20 @@ class Orchestrator:
     ) -> Dict[str, Any]:
         run_id = str(uuid.uuid4())
         memory = []
+        session_context = {}
         if session_id:
             memory = vector_store.search_memory(user_query, top_k=4, where={"session_id": session_id})
+            try:
+                from app.db.sqlite_store import get_messages
+                from app.services.context_resolver import extract_session_context
+                from app.services.langchain_memory import conversation_summary_memory
+                session_msgs = get_messages(session_id, limit=20)
+                session_context = extract_session_context(session_msgs)
+                session_context = conversation_summary_memory.build_context(
+                    session_msgs, session_context
+                )
+            except Exception as _ex:
+                logger.warning(f"Failed to fetch session context: {_ex}")
 
         services = service_manager.list_services()
         if not services:
@@ -155,16 +170,104 @@ class Orchestrator:
             }
 
         discovery = await discovery_agent.discover(user_query)
-        plan, llm_meta = await llm_engine.plan(user_query, services, memory_context=memory)
+        plan, llm_meta = await llm_engine.plan(
+            user_query,
+            services,
+            memory_context=memory,
+            chat_history=session_context.get("recent_turns"),
+            session_context=session_context,
+        )
         plan = _normalize_plan(plan)
         plan = _apply_safety_caps(plan)
+
+        # ── Detect precise intent (count-only / column-select) ───────────────
+        from app.services.query_intent_detector import detect_query_intent
+        # Collect available columns from first plan step's entity or session context
+        _step0 = plan.get("steps", [{}])[0] if plan.get("steps") else {}
+        _svc0 = _step0.get("service_id", "") or session_context.get("last_service_id", "")
+        _ent0 = _step0.get("entity_set", "") or session_context.get("last_entity_set", "")
+        _avail_cols: List[str] = session_context.get("last_columns") or []
+        if _svc0 and _ent0:
+            _svc_match = next((s for s in services if s["id"] == _svc0), None)
+            if _svc_match:
+                _prop_cols = list(_svc_match.get("entity_properties", {}).get(_ent0, []))
+                if _prop_cols:
+                    _avail_cols = _prop_cols
+        precise_intent = detect_query_intent(user_query, _avail_cols)
+
+        # Context fallback for step entity set if missing
+        if plan.get("steps"):
+            s0 = plan["steps"][0]
+            if not s0.get("entity_set") and session_context.get("last_entity_set"):
+                s0["entity_set"] = session_context["last_entity_set"]
+                s0["service_id"] = s0.get("service_id") or session_context.get("last_service_id", "")
+                logger.info(f"Context fallback applied to plan step: {s0['entity_set']}")
+
+        # ── Handle count_total: use server-side $count for accuracy ──────────
+        if precise_intent["type"] == "count_total" and plan.get("steps"):
+            step0 = plan["steps"][0]
+            sid = step0.get("service_id")
+            ent = step0.get("entity_set")
+            flt = step0.get("filter") or None
+            client = service_manager.get_client(sid) if sid else None
+            if client and ent:
+                try:
+                    count_val = await client.get_count(entity_set=ent, filter_expr=flt)
+                    if count_val is not None:
+                        logger.info(f"count_total intent: {ent} count={count_val}")
+                        count_table = {
+                            "columns": ["total_count"],
+                            "rows": [{"total_count": count_val}],
+                            "row_count": 1,
+                            "truncated": False,
+                            "total_count": count_val,
+                            "is_simple_count": True,
+                        }
+                        return {
+                            "run_id": run_id,
+                            "session_id": session_id,
+                            "user_query": user_query,
+                            "user_role": user_role,
+                            "discovery": discovery,
+                            "plan": _normalize_plan(plan),
+                            "tool_calls": [{"type": "odata.count", "service_id": sid, "entity_set": ent, "count": count_val}],
+                            "execution": [],
+                            "blocked_steps": [],
+                            "table": count_table,
+                            "primary_url": client._build_url(ent) if hasattr(client, "_build_url") else None,
+                            "primary_service": sid,
+                            "summary": f"There are **{count_val:,}** {ent}.",
+                            "error": None,
+                            "memory_used": memory,
+                            "llm_provider": llm_meta.get("provider", "unknown"),
+                            "llm_latency_ms": llm_meta.get("latency_ms", 0),
+                            "llm_tokens": llm_meta.get("tokens", 0),
+                            "intent": "count_total",
+                            "precise_intent": "count_total",
+                        }
+                except Exception as _ce:
+                    logger.warning(f"count_total fast-path failed: {_ce}; falling through to normal flow")
+
+        # ── Handle column_select: force $select to user-requested columns ────
+        # Skip if plan already has explicit column selection (including select=[] for all columns)
+        _has_explicit_select = any(step.get("select") is not None for step in plan.get("steps", []))
+        if precise_intent["type"] == "column_select" and precise_intent.get("columns") and not _has_explicit_select:
+            requested_cols = precise_intent["columns"]
+            for step in plan.get("steps", []):
+                step["select"] = requested_cols
+                step["_user_column_select"] = True
+            logger.info(f"column_select intent: forcing $select={requested_cols}")
+        # Store precise intent on plan for downstream use
+        plan["_precise_intent"] = precise_intent
 
         # For aggregation queries, remove $select so all columns are fetched
         from app.services.aggregator import detect_aggregation
         agg_info = detect_aggregation(user_query)
         if agg_info:
             for step in plan.get("steps", []):
-                step["select"] = []
+                # Don't override a user-explicit column selection
+                if not step.get("_user_column_select"):
+                    step["select"] = []
                 step["filter"] = ""
                 for key in list(step.keys()):
                     if key.lower() in ("groupby", "group_by", "aggregate", "aggregation"):
@@ -238,6 +341,7 @@ class Orchestrator:
             fields = write_op.get("fields", {})
             entity_id = write_op.get("entity_id")
             service_id = write_op.get("service_id") or (plan.get("target_services", [None])[0] if plan.get("target_services") else None)
+            required_fields = write_op.get("required_fields", [])
 
             # If LLM didn't provide write_operation, try to detect entity from discovery
             if not write_op or not entity_set:
@@ -253,7 +357,7 @@ class Orchestrator:
             # Get entity field requirements
             from app.services.guardrails import get_entity_field_requirements
             field_reqs = get_entity_field_requirements(service_id, entity_set) if service_id and entity_set else {}
-            entity_required = field_reqs.get("required_fields", [])
+            entity_required = list(set(field_reqs.get("required_fields", []) + required_fields))
 
             # Run input guards
             guard_result = run_input_guards(
@@ -265,99 +369,48 @@ class Orchestrator:
                 required_fields=entity_required,
                 confirmed=write_op.get("confirmed", False),
             )
-            if not guard_result.allow:
-                # Return write info so frontend can show the confirmation modal
-                return {
-                    "run_id": run_id,
-                    "session_id": session_id,
-                    "user_query": user_query,
-                    "user_role": user_role,
-                    "summary": f"**{operation.title()}** requires confirmation. Please fill in the required fields.",
-                    "plan": plan,
-                    "discovery": discovery,
-                    "tool_calls": [{"type": "guardrail_block", "reason": guard_result.reason}],
-                    "blocked_steps": [],
-                    "table": None,
-                    "primary_url": None,
-                    "primary_service": service_id,
-                    "error": None,
-                    "memory_used": memory,
-                    "llm_provider": llm_provider,
-                    "llm_latency_ms": llm_latency_ms,
-                    "llm_tokens": llm_tokens,
-                    "write_preview": {
-                        "preview": True,
-                        "operation": operation,
-                        "entity_set": entity_set,
-                        "service_id": service_id,
-                        "fields": fields,
-                        "entity_id": entity_id,
-                        "required_fields": entity_required,
-                        "optional_fields": field_reqs.get("optional_fields", [])[:10],
-                        "auto_generated_fields": field_reqs.get("auto_generated_fields", []),
-                        "missing_fields": [f for f in entity_required if f not in fields or not fields.get(f)],
-                        "confirmation_summary": f"**{operation.title()}** record in `{entity_set}` ({service_id}).\n\nRequired fields missing. Please provide the required values.",
-                        "needs_user_input": True,
-                    },
-                }
+            missing_fields = [f for f in entity_required if f not in fields or not fields.get(f)]
+            guard_reason = guard_result.reason if not guard_result.allow else ""
+            summary = f"**{operation.title()}** requires review before execution."
+            if missing_fields:
+                summary = f"**{operation.title()}** requires additional required fields before execution."
 
-            # Execute write operation
-            try:
-                from app.services.odata_client import ODataClient
-                svc = service_manager._services.get(service_id, {})
-                if not svc:
-                    error_message = f"Service '{service_id}' not found"
-                else:
-                    client = ODataClient(svc.get("base_url", ""), auth_type=svc.get("auth_type"), auth_config=svc.get("auth_config"))
-                    if operation == "create":
-                        result = await client.create(entity_set, fields)
-                    elif operation == "update":
-                        if not entity_id:
-                            error_message = "Entity ID required for update"
-                        else:
-                            result = await client.update(entity_set, entity_id, fields)
-                    elif operation == "delete":
-                        if not entity_id:
-                            error_message = "Entity ID required for delete"
-                        else:
-                            result = await client.delete(entity_set, entity_id)
-                    else:
-                        error_message = f"Unknown write operation: {operation}"
-
-                    if not error_message:
-                        # Run output guards
-                        result = run_output_guards(result, operation)
-                        tool_calls.append({
-                            "type": f"odata.{operation}",
-                            "service_id": service_id,
-                            "entity_set": entity_set,
-                            "success": True,
-                        })
-                        summary = f"Successfully {operation}d entity in **{entity_set}** ({service_id})."
-                        if operation == "create" and isinstance(result, dict):
-                            summary += f" New entity created: {result}"
-                        return {
-                            "run_id": run_id,
-                            "session_id": session_id,
-                            "user_query": user_query,
-                            "user_role": user_role,
-                            "summary": summary,
-                            "plan": plan,
-                            "discovery": discovery,
-                            "tool_calls": tool_calls,
-                            "blocked_steps": [],
-                            "table": None,
-                            "primary_url": None,
-                            "primary_service": service_id,
-                            "error": None,
-                            "memory_used": memory,
-                            "llm_provider": llm_provider,
-                            "llm_latency_ms": llm_latency_ms,
-                            "llm_tokens": llm_tokens,
-                        }
-            except Exception as e:
-                logger.exception(f"Write operation failed: {e}")
-                error_message = f"Write operation failed: {e}"
+            return {
+                "run_id": run_id,
+                "session_id": session_id,
+                "user_query": user_query,
+                "user_role": user_role,
+                "summary": summary,
+                "plan": plan,
+                "discovery": discovery,
+                "tool_calls": ([{"type": "guardrail_block", "reason": guard_reason}] if guard_reason else []),
+                "blocked_steps": [],
+                "table": None,
+                "primary_url": None,
+                "primary_service": service_id,
+                "error": None,
+                "memory_used": memory,
+                "llm_provider": llm_provider,
+                "llm_latency_ms": llm_latency_ms,
+                "llm_tokens": llm_tokens,
+                "write_preview": {
+                    "preview": True,
+                    "operation": operation,
+                    "entity_set": entity_set,
+                    "service_id": service_id,
+                    "fields": fields,
+                    "entity_id": entity_id,
+                    "required_fields": entity_required,
+                    "optional_fields": field_reqs.get("optional_fields", [])[:10],
+                    "auto_generated_fields": field_reqs.get("auto_generated_fields", []),
+                    "missing_fields": missing_fields,
+                    "confirmation_summary": (
+                        f"**{operation.title()}** record in `{entity_set}` ({service_id}).\n\n"
+                        + ("Required fields missing. Please provide the required values." if missing_fields else "Review the values below and confirm to execute this change.")
+                    ),
+                    "needs_user_input": True,
+                },
+            }
 
         for idx, step in enumerate(plan.get("steps", [])):
             sid = step.get("service_id")
@@ -489,49 +542,68 @@ class Orchestrator:
                 logger.warning(f"RAG: Failed to store plan: {e}")
 
         # Apply column filter to remove useless columns
+        _pi = plan.get("_precise_intent", {})
+        _user_selected_cols = _pi.get("type") == "column_select" and _pi.get("columns")
         if primary_table and primary_table.get("rows"):
             original_cols = len(primary_table.get("columns", []))
-            # Build smart column view using priority map
-            try:
-                from app.services.column_priority import get_top_columns
-                entity_name = plan.get("steps", [{}])[0].get("entity_set", "") if plan.get("steps") else ""
-                all_cols = primary_table.get("all_columns", primary_table.get("columns", []))
-                svc_id = primary_service or ""
-                # Get metadata XML from service data or fetch from client
-                svc_data = service_manager._services.get(svc_id, {})
-                metadata_xml = svc_data.get("metadata_xml", "")
-                if not metadata_xml and svc_id in service_manager._clients:
-                    client = service_manager._clients[svc_id]
-                    metadata_xml = getattr(client, "metadata_xml", "")
-                smart_cols = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        get_top_columns,
-                        entity_set_name=entity_name,
-                        service_id=svc_id,
-                        all_fields=all_cols,
-                        metadata_xml=metadata_xml,
-                        max_columns=20,
-                    ),
-                    timeout=2.0,
-                )
-                if smart_cols and len(smart_cols) < len(all_cols):
-                    smart_rows = [{k: row.get(k, "") for k in smart_cols} for row in (primary_table.get("all_rows") or primary_table.get("rows", []))]
-                    primary_table["smart_columns"] = smart_cols
-                    primary_table["smart_rows"] = smart_rows
-                else:
-                    primary_table["smart_columns"] = all_cols
-                    primary_table["smart_rows"] = primary_table.get("all_rows") or primary_table.get("rows", [])
-            except asyncio.TimeoutError:
-                logger.warning("Smart column generation timed out; returning unprioritized table")
-                primary_table["smart_columns"] = primary_table.get("columns", [])
-                primary_table["smart_rows"] = primary_table.get("rows", [])
-            except Exception as e:
-                logger.debug(f"Smart column generation failed: {e}")
 
-            primary_table = filter_columns(primary_table)
-            filtered_cols = len(primary_table.get("columns", []))
-            if original_cols != filtered_cols:
-                logger.info(f"Column filter: {original_cols} -> {filtered_cols} columns")
+            if _user_selected_cols:
+                # User asked for specific columns — enforce them exactly, skip smart/filter
+                requested_cols = _pi["columns"]
+                # Build case-insensitive resolved rows
+                resolved_rows = []
+                col_map = {c.lower(): c for c in primary_table.get("columns", [])}
+                resolved_cols = [col_map.get(rc.lower(), rc) for rc in requested_cols]
+                for r in primary_table.get("rows", []):
+                    resolved_rows.append({col_map.get(rc.lower(), rc): r.get(col_map.get(rc.lower(), rc), "") for rc in requested_cols})
+                primary_table["columns"] = resolved_cols
+                primary_table["rows"] = resolved_rows
+                logger.info(f"column_select: enforced columns={resolved_cols}")
+            else:
+                # Build smart column view using priority map
+                try:
+                    from app.services.column_priority import get_top_columns
+                    entity_name = plan.get("steps", [{}])[0].get("entity_set", "") if plan.get("steps") else ""
+                    all_cols = primary_table.get("all_columns", primary_table.get("columns", []))
+                    svc_id = primary_service or ""
+                    # Get metadata XML from service data or fetch from client
+                    svc_data = service_manager._services.get(svc_id, {})
+                    metadata_xml = svc_data.get("metadata_xml", "")
+                    if not metadata_xml and svc_id in service_manager._clients:
+                        client = service_manager._clients[svc_id]
+                        metadata_xml = getattr(client, "metadata_xml", "")
+                    smart_cols = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            get_top_columns,
+                            entity_set_name=entity_name,
+                            service_id=svc_id,
+                            all_fields=all_cols,
+                            metadata_xml=metadata_xml,
+                            max_columns=20,
+                        ),
+                        timeout=2.0,
+                    )
+                    if smart_cols and len(smart_cols) < len(all_cols):
+                        smart_rows = [{k: row.get(k, "") for k in smart_cols} for row in (primary_table.get("all_rows") or primary_table.get("rows", []))]
+                        primary_table["smart_columns"] = smart_cols
+                        primary_table["smart_rows"] = smart_rows
+                    else:
+                        primary_table["smart_columns"] = all_cols
+                        primary_table["smart_rows"] = primary_table.get("all_rows") or primary_table.get("rows", [])
+                except asyncio.TimeoutError:
+                    logger.warning("Smart column generation timed out; returning unprioritized table")
+                    primary_table["smart_columns"] = primary_table.get("columns", [])
+                    primary_table["smart_rows"] = primary_table.get("rows", [])
+                except Exception as e:
+                    logger.debug(f"Smart column generation failed: {e}")
+
+                _show_all_query = bool(re.match(r"^(?:show|list|get|display|fetch)\s+(?:me\s+)?(?:all\s+)", user_query, re.IGNORECASE))
+                _select_empty = not plan.get("steps", [{}])[0].get("select") if plan.get("steps") else False
+                _show_all = _show_all_query or _select_empty
+                primary_table = filter_columns(primary_table, show_all=_show_all)
+                filtered_cols = len(primary_table.get("columns", []))
+                if original_cols != filtered_cols:
+                    logger.info(f"Column filter: {original_cols} -> {filtered_cols} columns")
 
         return {
             "run_id": run_id,
@@ -553,6 +625,7 @@ class Orchestrator:
             "llm_latency_ms": llm_latency_ms,
             "llm_tokens": llm_tokens,
             "intent": llm_meta.get("intent"),
+            "precise_intent": _pi.get("type"),
         }
 
 

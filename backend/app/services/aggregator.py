@@ -37,6 +37,7 @@ AGGREGATION_PATTERNS = [
 ]
 
 SIMPLE_COUNT_PATTERNS = [
+    # Specific entity counts
     (r'\bcount\b.*\bcustomers?\b', "count", "CustomerID"),
     (r'\bcount\b.*\borders?\b', "count", "OrderID"),
     (r'\bcount\b.*\bproducts?\b', "count", "ProductID"),
@@ -49,6 +50,12 @@ SIMPLE_COUNT_PATTERNS = [
     (r'\bhow many\b.*\bemployees?\b', "count", "EmployeeID"),
     (r'\bnumber of\b.*\bcustomers?\b', "count", "CustomerID"),
     (r'\bnumber of\b.*\borders?\b', "count", "OrderID"),
+    # Generic total-count patterns (no specific entity ID column needed)
+    (r'\bhow many\b', "count", None),
+    (r'\bnumber of\b', "count", None),
+    (r'\btotal number\b', "count", None),
+    (r'^count\s+\w', "count", None),
+    (r'^total\s+\w+s\b', "count", None),
 ]
 
 PERCENTAGE_PATTERNS = [
@@ -61,7 +68,6 @@ PERCENTAGE_PATTERNS = [
     (r'which.*(?:has|have).*(?:least|fewest|most|highest|lowest).*in\s+(\w+)', "count", None),
     (r'which.*(?:country|city|category).*has.*(?:least|fewest|most|highest|lowest)', "count", None),
     (r'what.*(?:country|city|category).*has.*(?:least|fewest|most|highest|lowest)', "count", None),
-    (r'(?:show|find|get).*(?:least|fewest|most|highest|lowest)', "count", None),
 ]
 
 COUNTRY_NAMES = {
@@ -187,13 +193,15 @@ def aggregate(rows: List[Dict], columns: List[str], agg_info: Dict[str, Any]) ->
         agg_col = _find_numeric_column(rows, columns)
 
     if func == "count" and not group_col:
-        result_row = {f"total_{func}": len(rows)}
+        count_val = len(rows)
+        result_row = {"total_count": count_val}
         return {
-            "columns": list(result_row.keys()),
+            "columns": ["total_count"],
             "rows": [result_row],
             "row_count": 1,
             "truncated": False,
-            "total_count": 1,
+            "total_count": count_val,
+            "is_simple_count": True,
         }
 
     if group_col:

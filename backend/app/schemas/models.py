@@ -48,6 +48,8 @@ class TableData(BaseModel):
     smart_columns: Optional[List[str]] = None
     smart_rows: Optional[List[Dict[str, Any]]] = None
     filter_note: Optional[str] = None
+    is_simple_count: Optional[bool] = None  # True when result is a single total-count cell
+
 
 
 class DiscoveryCandidate(BaseModel):

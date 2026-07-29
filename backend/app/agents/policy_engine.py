@@ -66,7 +66,7 @@ class PolicyEngine:
             return {"allowed": False, "reason": f"Role '{role_id}' is not permitted to access entity set '{entity_set}'."}
         allowed_ops = set(role.get("allowed_ops") or [])
         for k in plan.keys():
-            if k in {"service_id", "entity_set"}:
+            if k in {"service_id", "entity_set", "_user_column_select"}:
                 continue
             if k not in allowed_ops and plan.get(k) not in (None, [], ""):
                 return {"allowed": False, "reason": f"Role '{role_id}' is not permitted to use the '{k}' operation."}
