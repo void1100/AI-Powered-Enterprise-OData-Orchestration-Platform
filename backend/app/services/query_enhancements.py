@@ -23,7 +23,7 @@ class QueryCache:
         self._ttl = ttl_seconds
 
     def _make_key(self, query: str, session_id: str = "") -> str:
-        raw = query.strip().lower()
+        raw = f"{query.strip().lower()}::{session_id}"
         return hashlib.md5(raw.encode()).hexdigest()
 
     def get(self, query: str, session_id: str = "") -> Optional[Dict[str, Any]]:
@@ -41,7 +41,18 @@ class QueryCache:
         if len(self._cache) >= self._max_size:
             oldest = min(self._cache, key=lambda k: self._cache[k]["ts"])
             del self._cache[oldest]
-        self._cache[key] = {"data": data, "ts": time.time()}
+        self._cache[key] = {"data": data, "ts": time.time(), "session_id": session_id}
+
+    def clear_session(self, session_id: str):
+        """Remove all cache entries belonging to a specific session."""
+        keys_to_remove = [
+            k for k, v in self._cache.items()
+            if v.get("session_id") == session_id
+        ]
+        for k in keys_to_remove:
+            del self._cache[k]
+        if keys_to_remove:
+            logger.info(f"Cache cleared {len(keys_to_remove)} entries for session {session_id}")
 
     def clear(self):
         self._cache.clear()

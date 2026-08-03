@@ -6,6 +6,7 @@ $count, and a fallback "schema sampling" pass for services whose metadata
 doesn't include full type definitions (e.g. the public ODataSamples
 Northwind service).
 """
+import asyncio
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -119,7 +120,10 @@ class ODataClient:
         xml_text = resp.text
         self._metadata_xml = xml_text
         meta = self._parse_metadata(xml_text)
-        await self._enrich_by_sampling(meta)
+        try:
+            await asyncio.wait_for(self._enrich_by_sampling(meta), timeout=10)
+        except Exception as e:
+            logger.warning(f"Sampling enrichment skipped (timeout/error): {e}")
         self._metadata_cache = meta
         return self._metadata_cache
 

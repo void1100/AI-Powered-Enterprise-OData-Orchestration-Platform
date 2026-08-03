@@ -171,6 +171,16 @@ async def chat(payload: ChatRequest, request: Request):
     from app.services.query_enhancements import query_cache, summarize_results, recommend_charts, get_drill_down_links
     cached_result = query_cache.get(payload.query, session_id)
     if cached_result:
+        add_message(
+            session_id,
+            "assistant",
+            cached_result.get("summary", ""),
+            plan=cached_result.get("plan"),
+            result={
+                "table": cached_result.get("table"),
+                "tool_calls": cached_result.get("tool_calls", []),
+            },
+        )
         cached_result["cached"] = True
         _log("cached", 0, 0, intent="cached", cached=True)
         return ChatResponse(**cached_result)

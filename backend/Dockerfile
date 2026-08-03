@@ -3,7 +3,8 @@ FROM python:3.11-slim AS base
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    CHROMA_ONNX_CACHE=/root/.cache/chroma/onnx_models/all-MiniLM-L6-v2
 
 WORKDIR /app
 
@@ -22,6 +23,9 @@ COPY backend/scripts /app/scripts
 COPY backend/run.py /app/run.py
 
 RUN mkdir -p /app/data && chmod -R 777 /app/data
+
+# Pre-download ChromaDB ONNX embedding model (avoids slow download at runtime)
+RUN python /app/scripts/download_onnx.py
 
 EXPOSE 8000
 

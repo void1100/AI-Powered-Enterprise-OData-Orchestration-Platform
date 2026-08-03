@@ -121,7 +121,12 @@ class LLMReasoningEngine:
         return None
 
     def _detect_exact_entity(self, services: List[Dict[str, Any]], query: str) -> Optional[Tuple[str, str]]:
-        """Return (service_id, entity_set) when the query contains an exact entity set name."""
+        """Return (service_id, entity_set) when the query contains an exact entity set name.
+        
+        Prefers healthy matches, but falls back to unhealthy exact matches when the
+        query strongly matches an entity name (score > 1000). This avoids falling
+        back to completely wrong entities when the correct one is temporarily unhealthy.
+        """
         q = query.lower()
         q_compact = re.sub(r"[^a-z0-9]", "", q)
         healthy_matches: List[Tuple[int, str, str]] = []
@@ -161,13 +166,58 @@ class LLMReasoningEngine:
                         unhealthy_matches.append((score, svc["id"], entity))
                     else:
                         healthy_matches.append((score, svc["id"], entity))
-        # Prefer healthy matches, but fall back to unhealthy if no healthy match found
-        matches = healthy_matches or unhealthy_matches
-        if not matches:
+        
+        all_matches = healthy_matches + unhealthy_matches
+        if not all_matches:
             return None
-        matches.sort(reverse=True)
-        _, service_id, entity_set = matches[0]
-        return service_id, entity_set
+        all_matches.sort(reverse=True)
+        best_score, best_svc, best_entity = all_matches[0]
+        
+        if healthy_matches:
+            healthy_matches.sort(reverse=True)
+            best_healthy_score = healthy_matches[0][0]
+            if best_score > best_healthy_score * 2 and best_score > 50:
+                logger.info(f"Exact entity {best_entity} is unhealthy but scores {best_score} vs best healthy {best_healthy_score}; using it")
+                return best_svc, best_entity
+            matched_svc, matched_entity = healthy_matches[0][1], healthy_matches[0][2]
+        else:
+            if best_score > 20:
+                logger.info(f"Exact entity {best_entity} is unhealthy but only match; using it")
+                return best_svc, best_entity
+            return None
+
+        # Property-based override: if the matched entity name is ambiguous
+        # (e.g. "Material" matches I_Material but query mentions column names
+        # like "ManufacturingOrderType" that belong to I_ManufacturingOrder),
+        # check if another entity has more column name matches in the query.
+        entity_props = {}
+        for svc in services:
+            if svc["id"] != matched_svc:
+                continue
+            entity_props = svc.get("entity_properties", {})
+            break
+        if entity_props:
+            best_prop_entity = None
+            best_prop_count = 0
+            for es_name, props in entity_props.items():
+                if es_name == matched_entity or not props:
+                    continue
+                count = 0
+                for p in props:
+                    p_spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", p).lower()
+                    if p_spaced in q or p.lower() in q:
+                        count += 1
+                if count > best_prop_count:
+                    best_prop_count = count
+                    best_prop_entity = es_name
+            if best_prop_entity and best_prop_count >= 2:
+                logger.info(
+                    f"Property override: {best_prop_entity} ({best_prop_count} column matches) "
+                    f"preferred over entity name match {matched_entity}"
+                )
+                return matched_svc, best_prop_entity
+
+        return matched_svc, matched_entity
 
     def find_entity_candidates(
         self,
@@ -301,6 +351,69 @@ class LLMReasoningEngine:
             "entity_labels": truncated_labels,
         }
 
+    def _prefer_session_entity_for_followup(
+        self,
+        query: str,
+        exact_entity: Optional[Tuple[str, str]],
+        session_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Tuple[str, str]]:
+        if not exact_entity or not session_context:
+            return exact_entity
+
+        last_service = session_context.get("last_service_id")
+        last_entity = session_context.get("last_entity_set")
+        last_columns = session_context.get("last_columns") or []
+        if not last_service or not last_entity:
+            return exact_entity
+
+        if exact_entity == (last_service, last_entity):
+            return exact_entity
+
+        try:
+            from app.services.query_intent_detector import detect_query_intent
+            followup_intent = detect_query_intent(query, last_columns)
+        except Exception:
+            return exact_entity
+
+        intent_type = followup_intent.get("type")
+
+        # Column select, count total — always prefer session entity
+        if intent_type in {"column_select", "count_total"}:
+            logger.info(
+                f"Session follow-up detected (intent={intent_type}); preferring prior entity "
+                f"{last_service}/{last_entity} over exact match {exact_entity[0]}/{exact_entity[1]}"
+            )
+            return last_service, last_entity
+
+        # Filter-based follow-up: "show records where X = Y" / "filter by X"
+        # If the query has a where/filter clause but the matched entity came from
+        # a property name (e.g. "BillOfMaterial" matching I_Material), prefer the
+        # session entity because the user is likely filtering the previous entity.
+        q_lower = query.lower()
+        has_filter = bool(re.search(r'\b(where|filter|equals?|eq)\b', q_lower))
+        if has_filter and intent_type is None:
+            # Check if the entity match came from a property name (not an explicit entity name)
+            # by seeing if any entity name words appear directly in the query
+            q_compact = re.sub(r"[^a-z0-9]", "", q_lower)
+            last_entity_no_prefix = re.sub(r"^[aci]_", "", last_entity, flags=re.IGNORECASE).lower()
+            last_entity_compact = re.sub(r"[^a-z0-9]", "", last_entity_no_prefix)
+            last_entity_spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", last_entity_no_prefix).lower().replace("_", " ")
+
+            # Only override if the query does NOT explicitly name an entity
+            explicit_entity_match = (
+                last_entity_compact in q_compact or
+                last_entity_no_prefix in q_lower or
+                last_entity_spaced in q_lower
+            )
+            if not explicit_entity_match:
+                logger.info(
+                    f"Session follow-up detected (filter-based); preferring prior entity "
+                    f"{last_service}/{last_entity} over exact match {exact_entity[0]}/{exact_entity[1]}"
+                )
+                return last_service, last_entity
+
+        return exact_entity
+
     async def plan(
         self,
         query: str,
@@ -314,6 +427,7 @@ class LLMReasoningEngine:
         is_write = bool(re.search(r"\b(create|add|new|insert|update|modify|change|delete|remove|edit|set|replace)\b", query.lower()))
         has_filter_or_id = bool(re.search(r'(\b(where|for|from|with|in|having|filter|equal|greater|less|like)\b|\b(number|no|#|id)\b|\b[a-zA-Z]+\s*[:=]\s*|\b\d{3,}\b)', query.lower()))
         exact_entity = self._detect_exact_entity(available_services, query) if not is_complex and not is_write else None
+        exact_entity = self._prefer_session_entity_for_followup(query, exact_entity, session_context=session_context)
         if exact_entity:
             service_id, entity_set = exact_entity
             svc = next((s for s in available_services if s["id"] == service_id), None)
@@ -377,7 +491,7 @@ class LLMReasoningEngine:
             logger.info(f"Skipping LLM for intent={intent} with explicit service={explicit_service}")
             self.optimizer._stats["llm_skipped"] += 1
             t0 = time.perf_counter()
-            plan = self._plan_mock(query, filtered, memory_context)
+            plan = self._plan_mock(query, filtered, memory_context, session_context=session_context)
             plan = self.optimizer.optimize_plan(plan, query)
             self.optimizer.cache_plan(query, service_ids, plan)
             return plan, {"provider": "mock", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": 0, "intent": intent}
@@ -419,7 +533,7 @@ class LLMReasoningEngine:
             except Exception as e:
                 logger.warning(f"NVIDIA planning failed, falling back to mock: {e}")
         t0 = time.perf_counter()
-        plan = self._plan_mock(query, available_services, memory_context)
+        plan = self._plan_mock(query, available_services, memory_context, session_context=session_context)
         plan = self.optimizer.optimize_plan(plan, query)
         self.optimizer.cache_plan(query, service_ids, plan)
         return plan, {"provider": "mock", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": 0, "intent": intent}
@@ -489,6 +603,7 @@ class LLMReasoningEngine:
         select, expand, filter_expr, orderby, top = self._build_query_parts(
             q, entity_set, candidate_properties,
             service_id=chosen_service or "", metadata_xml=metadata_xml,
+            session_context=session_context,
         )
         steps = []
         if chosen_service and entity_set:
@@ -654,6 +769,91 @@ class LLMReasoningEngine:
             if es_lower in qn_lower or es.lower() in qn_lower:
                 return es, []
 
+        # Property-based match: if query words match entity property names, prefer
+        # the entity that owns those properties (e.g. "BillOfMaterial" and "OrderType"
+        # are columns of I_ManufacturingOrder, not I_BillOfMaterialItemCategory)
+        svc_data = next((s for s in services if s["id"] == service_id), None)
+        entity_props = svc_data.get("entity_properties", {}) if svc_data else {}
+        if entity_props:
+            # Build a map of query words to possible property name forms
+            def _prop_forms(prop_name: str):
+                """Generate lowercase forms of a property name for matching."""
+                forms = {prop_name.lower()}
+                spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", prop_name).lower()
+                forms.add(spaced)
+                forms.add(spaced.replace(" ", ""))
+                # Individual words from camelCase
+                words = re.findall(r"[a-z0-9]{2,}", spaced)
+                for w in words:
+                    forms.add(w)
+                return forms
+
+            # Phase 1: exact column name matching (e.g. "bill of material" -> "BillOfMaterial")
+            # Check if any multi-word query phrase exactly matches a property name
+            # Collect ALL entities with matches, then pick the best
+            exact_candidates = []
+            for es_name in available_entities:
+                props = entity_props.get(es_name, [])
+                if not props:
+                    continue
+                exact_matches = 0
+                match_specificity = 0.0
+                for p in props:
+                    p_spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", p).lower()
+                    if p_spaced in qn:
+                        exact_matches += 1
+                        p_words = set(p_spaced.split())
+                        q_words_in_prop = p_words & qn_words
+                        match_specificity += len(q_words_in_prop) / max(len(p_words), 1)
+                    elif p.lower() in qn:
+                        exact_matches += 1
+                        match_specificity += 0.5
+                if exact_matches >= 2:
+                    exact_candidates.append((exact_matches, match_specificity, len(props), es_name))
+            if exact_candidates:
+                # Sort by: most matches > highest specificity > most total properties (richer entity)
+                exact_candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+                best_es = exact_candidates[0][3]
+                logger.info(
+                    f"Property-based entity match (exact): {best_es} "
+                    f"({exact_candidates[0][0]} matches, specificity={exact_candidates[0][1]:.2f}, "
+                    f"total_props={exact_candidates[0][2]}) selected"
+                )
+                candidate_props = entity_props.get(best_es, [])
+                return best_es, candidate_props
+
+            # Phase 2: fuzzy word matching (fallback)
+            # Count how many distinct properties are matched by query words,
+            # preferring entities where each query term maps to a different property
+            prop_scores = {}
+            for es_name in available_entities:
+                props = entity_props.get(es_name, [])
+                if not props:
+                    continue
+                # For each property, check which query words match it
+                prop_match_count = 0
+                matched_props = set()
+                for p in props:
+                    p_forms = _prop_forms(p)
+                    for w in qn_words:
+                        if any(w in f for f in p_forms) and p not in matched_props:
+                            prop_match_count += 1
+                            matched_props.add(p)
+                            break
+                if prop_match_count > 0:
+                    prop_scores[es_name] = prop_match_count
+            if prop_scores:
+                best_prop_entity = max(prop_scores, key=prop_scores.get)
+                best_count = prop_scores[best_prop_entity]
+                second_count = sorted(prop_scores.values(), reverse=True)[1] if len(prop_scores) > 1 else 0
+                if best_count >= 2 or (best_count >= 1 and best_count > second_count):
+                    logger.info(
+                        f"Property-based entity match (fuzzy): {best_prop_entity} "
+                        f"({best_count} distinct properties matched) selected over scored entities"
+                    )
+                    candidate_props = entity_props.get(best_prop_entity, [])
+                    return best_prop_entity, candidate_props
+
         scored = [(es, score_entity(es, qn_words)) for es in available_entities]
         scored.sort(key=lambda x: -x[1])
         logger.info(f"Entity scoring for query '{qn[:60]}': top 5 = {[(es, round(sc, 3)) for es, sc in scored[:5]]}")
@@ -796,7 +996,7 @@ class LLMReasoningEngine:
                 condition = raw_condition.strip(" ,")
                 if not condition:
                     continue
-                translated = self._translate_filter(condition)
+                translated = self._translate_filter(condition, candidate_properties)
                 if translated:
                     translated_conditions.append(translated)
             explicit_filters.extend(translated_conditions)
@@ -841,9 +1041,24 @@ class LLMReasoningEngine:
             filtered_fields.add("UnitsInStock")
 
         # Document / Order number filter extraction (e.g. "from the order number 1000025", "for order 1000025", "order 1000025")
-        m_ord = re.search(r'\b(?:order|purchase\s+order|manufacturing\s+order|mfg\s+order)\s+(?:number|no|#|id)?\s*[:=]?\s*[\'"]?(\w+)[\'"]?', q, re.IGNORECASE)
+        order_value_pattern = r'([A-Za-z0-9_-]*\d[A-Za-z0-9_-]*)'
+        m_ord = re.search(
+            rf'\b(?:purchase\s+order|manufacturing\s+order|mfg\s+order)\s+(?:number|no|#|id)?\s*[:=]?\s*[\'"]?{order_value_pattern}[\'"]?',
+            q,
+            re.IGNORECASE,
+        )
         if not m_ord:
-            m_ord = re.search(r'\b(?:from|for|in|with|of)\s+(?:the\s+)?(?:order|purchase\s+order|manufacturing\s+order)\s+(?:number|no|#|id)?\s*[:=]?\s*[\'"]?(\w+)[\'"]?', q, re.IGNORECASE)
+            m_ord = re.search(
+                rf'\border\s+(?:number|no|#|id)\s*[:=]?\s*[\'"]?{order_value_pattern}[\'"]?',
+                q,
+                re.IGNORECASE,
+            )
+        if not m_ord:
+            m_ord = re.search(
+                rf'\b(?:from|for|in|with|of)\s+(?:the\s+)?(?:order|purchase\s+order|manufacturing\s+order)\s+(?:number|no|#|id)?\s*[:=]?\s*[\'"]?{order_value_pattern}[\'"]?',
+                q,
+                re.IGNORECASE,
+            )
         if m_ord:
             ord_val = m_ord.group(1).strip()
             ord_col = None
@@ -927,56 +1142,92 @@ class LLMReasoningEngine:
 
         return select, list(dict.fromkeys(expand)), filter_expr, orderby, top
 
-    def _translate_filter(self, raw: str) -> str:
+    def _resolve_filter_field(self, field: str, candidate_properties: Optional[List[str]] = None) -> str:
+        cleaned = field.strip()
+        if not cleaned:
+            return ""
+        if not candidate_properties:
+            return cleaned.replace(" ", "")
+
+        normalized = re.sub(r"[^a-z0-9]", "", cleaned.lower())
+        if not normalized:
+            return cleaned.replace(" ", "")
+
+        exact_map = {
+            re.sub(r"[^a-z0-9]", "", col.lower()): col
+            for col in candidate_properties
+        }
+        if normalized in exact_map:
+            return exact_map[normalized]
+
+        partial_matches = [
+            col for key, col in exact_map.items()
+            if normalized in key or key in normalized
+        ]
+        if len(partial_matches) == 1:
+            return partial_matches[0]
+        if len(partial_matches) > 1:
+            return min(partial_matches, key=len)
+
+        return cleaned.replace(" ", "")
+
+    def _translate_filter(self, raw: str, candidate_properties: Optional[List[str]] = None) -> str:
         raw = raw.strip().strip(",")
         # NL comparisons FIRST (before generic "is" which is too greedy)
         m = re.match(r"([\w\s]+?)\s+is\s+(?:greater|more|higher|bigger)\s+than\s+([\d.]+)", raw, re.IGNORECASE)
         if m:
-            field = m.group(1).strip().replace(" ", "")
+            field = self._resolve_filter_field(m.group(1), candidate_properties)
             return f"{field} gt {m.group(2)}"
         m = re.match(r"([\w\s]+?)\s+is\s+(?:less|lower|smaller|fewer)\s+than\s+([\d.]+)", raw, re.IGNORECASE)
         if m:
-            field = m.group(1).strip().replace(" ", "")
+            field = self._resolve_filter_field(m.group(1), candidate_properties)
             return f"{field} lt {m.group(2)}"
         m = re.match(r"([\w\s]+?)\s+is\s+(?:greater|more|higher)\s+than\s+or\s+equal\s+(?:to\s+)?([\d.]+)", raw, re.IGNORECASE)
         if m:
-            field = m.group(1).strip().replace(" ", "")
+            field = self._resolve_filter_field(m.group(1), candidate_properties)
             return f"{field} ge {m.group(2)}"
         m = re.match(r"([\w\s]+?)\s+is\s+(?:less|lower|smaller)\s+than\s+or\s+equal\s+(?:to\s+)?([\d.]+)", raw, re.IGNORECASE)
         if m:
-            field = m.group(1).strip().replace(" ", "")
+            field = self._resolve_filter_field(m.group(1), candidate_properties)
             return f"{field} le {m.group(2)}"
         # Symbolic comparisons: "price>20", "amount>=100"
-        m = re.match(r"([\w]+)\s*(>|>=|<|<=)\s*([\d.]+)", raw)
+        m = re.match(r"([\w\s]+?)\s*(>|>=|<|<=)\s*([\d.]+)", raw)
         if m:
             op_map = {">": "gt", ">=": "ge", "<": "lt", "<=": "le"}
-            return f"{m.group(1)} {op_map[m.group(2)]} {m.group(3)}"
+            field = self._resolve_filter_field(m.group(1), candidate_properties)
+            return f"{field} {op_map[m.group(2)]} {m.group(3)}"
         # Generic "is" patterns (must be after comparisons)
-        m = re.match(r"([\w]+)\s+is\s+'([^']*)'", raw, re.IGNORECASE)
+        m = re.match(r"([\w\s]+?)\s+is\s+'([^']*)'", raw, re.IGNORECASE)
         if m:
-            return f"{m.group(1)} eq '{m.group(2)}'"
-        m = re.match(r"([\w]+)\s+is\s+([\w\d\.\-]+)", raw, re.IGNORECASE)
+            field = self._resolve_filter_field(m.group(1), candidate_properties)
+            return f"{field} eq '{m.group(2)}'"
+        m = re.match(r"([\w\s]+?)\s+is\s+([\w\d\.\-]+)", raw, re.IGNORECASE)
         if m:
+            field = self._resolve_filter_field(m.group(1), candidate_properties)
             v = m.group(2)
             if v.replace(".", "").replace("-", "").isdigit():
-                return f"{m.group(1)} eq {v}"
-            return f"{m.group(1)} eq '{v}'"
-        m = re.match(r"([\w]+)\s*=\s*'([^']*)'", raw)
+                return f"{field} eq {v}"
+            return f"{field} eq '{v}'"
+        m = re.match(r"([\w\s]+?)\s*=\s*'([^']*)'", raw)
         if m:
-            return f"{m.group(1)} eq '{m.group(2)}'"
-        m = re.match(r"([\w]+)\s*=\s*([\w\d\.\-]+)", raw)
+            field = self._resolve_filter_field(m.group(1), candidate_properties)
+            return f"{field} eq '{m.group(2)}'"
+        m = re.match(r"([\w\s]+?)\s*=\s*([\w\d\.\-]+)", raw)
         if m:
+            field = self._resolve_filter_field(m.group(1), candidate_properties)
             v = m.group(2)
             if v.replace(".", "").replace("-", "").isdigit():
-                return f"{m.group(1)} eq {v}"
-            return f"{m.group(1)} eq '{v}'"
-        m = re.match(r"([\w]+)\s+contains\s+([\w\s\.-]+)", raw, re.IGNORECASE)
+                return f"{field} eq {v}"
+            return f"{field} eq '{v}'"
+        m = re.match(r"([\w\s]+?)\s+contains\s+([\w\s\.-]+)", raw, re.IGNORECASE)
         if m:
-            return f"contains({m.group(1)}, '{m.group(2).strip()}')"
-        m = re.match(r"([\w]+)\s+contains\s+'([^']*)'", raw)
+            field = self._resolve_filter_field(m.group(1), candidate_properties)
+            return f"contains({field}, '{m.group(2).strip()}')"
+        m = re.match(r"([\w\s]+?)\s+contains\s+'([^']*)'", raw)
         if m:
-            return f"contains({m.group(1)},'{m.group(2)}')"
-        return raw
+            field = self._resolve_filter_field(m.group(1), candidate_properties)
+            return f"contains({field},'{m.group(2)}')"
+        return ""
 
     # Columns that are always useful (keep these)
     _KEEP_PATTERNS = [
@@ -1049,7 +1300,7 @@ class LLMReasoningEngine:
     ) -> Tuple[Dict[str, Any], int]:
         from openai import AsyncOpenAI
 
-        mock_plan = self._plan_mock(query, services, memory_context)
+        mock_plan = self._plan_mock(query, services, memory_context, session_context=session_context)
         suggestions = []
         for step in mock_plan.get("steps", []):
             suggestions.append({
@@ -1161,7 +1412,7 @@ class LLMReasoningEngine:
     ) -> Tuple[Dict[str, Any], int]:
         from openai import AsyncOpenAI
 
-        mock_plan = self._plan_mock(query, services, memory_context)
+        mock_plan = self._plan_mock(query, services, memory_context, session_context=session_context)
         suggestions = []
         for step in mock_plan.get("steps", []):
             suggestions.append({
@@ -1292,7 +1543,7 @@ class LLMReasoningEngine:
     ) -> Tuple[Dict[str, Any], int]:
         from openai import AsyncOpenAI
 
-        mock_plan = self._plan_mock(query, services, memory_context)
+        mock_plan = self._plan_mock(query, services, memory_context, session_context=session_context)
         suggestions = []
         for step in mock_plan.get("steps", []):
             suggestions.append({
@@ -1414,7 +1665,7 @@ class LLMReasoningEngine:
         client = genai.Client(api_key=settings.gemini_api_key)
         model = self.model or settings.llm_model or "gemini-2.0-flash"
 
-        mock_plan = self._plan_mock(query, services, memory_context)
+        mock_plan = self._plan_mock(query, services, memory_context, session_context=session_context)
         suggestions = []
         for step in mock_plan.get("steps", []):
             suggestions.append({
@@ -1465,7 +1716,7 @@ class LLMReasoningEngine:
         try:
             return json.loads(content), tokens
         except Exception:
-            return self._plan_mock(query, services, memory_context), tokens
+            return self._plan_mock(query, services, memory_context, session_context=session_context), tokens
 
     async def _correct_openai(
         self,

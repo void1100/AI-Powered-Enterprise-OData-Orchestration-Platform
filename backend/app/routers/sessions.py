@@ -72,6 +72,11 @@ async def delete_session_endpoint(session_id: str, request: Request):
     if not is_admin and session.get("user_id") and user_id and session["user_id"] != user_id:
         raise HTTPException(status_code=403, detail="You do not own this session")
     delete_session(session_id)
+    try:
+        from app.services.query_enhancements import query_cache
+        query_cache.clear_session(session_id)
+    except Exception:
+        pass
     return {"deleted": session_id}
 
 

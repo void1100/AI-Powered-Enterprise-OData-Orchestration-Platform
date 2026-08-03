@@ -1,12 +1,27 @@
-"""ConversationSummaryMemory — auto-summarizes older turns to reduce token
+"""ConversationSummaryMemory - auto-summarizes older turns to reduce token
 usage while preserving conversational context for the LLM planner.
 
-Uses langchain_core.messages for structured chat history.
-No extra LLM call per turn — extractive summarization keeps it fast.
+Uses langchain_core.messages when available. Falls back to lightweight local
+message classes so the memory path still works if that optional dependency is
+not installed in the active environment.
 """
-from typing import Any, Dict, List, Optional
-from langchain_core.messages import HumanMessage, AIMessage
+from typing import Any, Dict, List
 from loguru import logger
+
+try:
+    from langchain_core.messages import HumanMessage, AIMessage
+except ModuleNotFoundError:
+    class _BaseMessage:
+        def __init__(self, content: str):
+            self.content = content
+
+    class HumanMessage(_BaseMessage):
+        pass
+
+    class AIMessage(_BaseMessage):
+        pass
+
+    logger.warning("langchain_core not installed; using local message shims for conversation memory")
 
 
 class ConversationSummaryMemory:

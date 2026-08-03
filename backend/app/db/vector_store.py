@@ -18,21 +18,11 @@ class VectorStore:
         os.makedirs(settings.chroma_persist_dir, exist_ok=True)
         self._client = chromadb.PersistentClient(path=settings.chroma_persist_dir)
         self._embed_fn = None
-        try:
-            from chromadb.utils import embedding_functions as _ef
-            if hasattr(_ef, "DefaultEmbeddingFunction"):
-                self._embed_fn = _ef.DefaultEmbeddingFunction()
-                logger.info("Using ChromaDB DefaultEmbeddingFunction (no model download required).")
-        except Exception as e:
-            logger.warning(f"Could not initialize default embedding function: {e}")
-        if self._embed_fn is None:
-            try:
-                self._embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-                    model_name=settings.embedding_model
-                )
-            except Exception as e:
-                logger.warning(f"SentenceTransformer unavailable ({e}); embeddings disabled.")
-                self._embed_fn = None
+        self._embed_fn_loaded = False
+        self._embed_available = False
+        self._init_collections()
+
+    def _init_collections(self):
         self.tools = self._client.get_or_create_collection(
             name="tools",
             embedding_function=self._embed_fn,
@@ -43,6 +33,21 @@ class VectorStore:
             embedding_function=self._embed_fn,
             metadata={"hnsw:space": "cosine"},
         )
+
+    def _ensure_embed_fn(self):
+        if self._embed_fn_loaded:
+            return self._embed_fn
+        self._embed_fn_loaded = True
+        try:
+            self._embed_fn = embedding_functions.ONNXMiniLM_L6_V2()
+            self._embed_available = True
+            self._init_collections()
+            logger.info("ChromaDB ONNX embedding function loaded successfully.")
+        except Exception as e:
+            logger.warning(f"ChromaDB embedding unavailable ({e}); vector search disabled.")
+            self._embed_fn = None
+            self._embed_available = False
+        return self._embed_fn
 
     def _flatten_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
         """ChromaDB only accepts scalar metadata values. Convert lists/dicts
@@ -61,7 +66,15 @@ class VectorStore:
                 out[k] = str(v)
         return out
 
+    def _ensure_embed_available(self):
+        """Trigger lazy load of embedding function. No-op if already tried."""
+        if not self._embed_fn_loaded:
+            self._ensure_embed_fn()
+
     def index_tool(self, tool_id: str, text: str, metadata: Dict[str, Any]):
+        self._ensure_embed_available()
+        if not self._embed_available:
+            return
         meta = self._flatten_metadata(metadata)
         try:
             existing = self.tools.get(ids=[tool_id])
@@ -73,7 +86,8 @@ class VectorStore:
         self.tools.add(ids=[tool_id], documents=[text], metadatas=[meta])
 
     def index_tools_bulk(self, items: List[Dict[str, Any]]):
-        if not items:
+        self._ensure_embed_available()
+        if not self._embed_available or not items:
             return
         ids, docs, metas = [], [], []
         for it in items:
@@ -90,6 +104,9 @@ class VectorStore:
                 logger.warning(f"Bulk add fallback failed: {e2}")
 
     def search_tools(self, query: str, top_k: int = 8) -> List[Dict[str, Any]]:
+        self._ensure_embed_available()
+        if not self._embed_available:
+            return []
         try:
             res = self.tools.query(query_texts=[query], n_results=top_k)
         except Exception as e:
@@ -103,6 +120,9 @@ class VectorStore:
         return out
 
     def add_memory(self, memory_id: str, text: str, metadata: Dict[str, Any]):
+        self._ensure_embed_available()
+        if not self._embed_available:
+            return
         meta = self._flatten_metadata(metadata)
         try:
             self.memory.upsert(ids=[memory_id], documents=[text], metadatas=[meta])
@@ -110,6 +130,9 @@ class VectorStore:
             self.memory.add(ids=[memory_id], documents=[text], metadatas=[meta])
 
     def search_memory(self, query: str, top_k: int = 5, where: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        self._ensure_embed_available()
+        if not self._embed_available:
+            return []
         try:
             res = self.memory.query(query_texts=[query], n_results=top_k, where=where)
         except Exception as e:
