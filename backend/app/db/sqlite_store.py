@@ -4,7 +4,7 @@ import json
 import sqlite3
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import List, Dict, Any, Optional
 from loguru import logger
 
@@ -73,7 +73,7 @@ def _init_schema(conn: sqlite3.Connection):
 
 def create_session(title: str = "New Chat", user_role: str = "Admin", user_id: Optional[str] = None) -> str:
     sid = str(uuid.uuid4())
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(UTC).isoformat()
     with _lock:
         conn = _get_conn()
         conn.execute(
@@ -123,7 +123,7 @@ def rename_session(session_id: str, title: str):
         conn = _get_conn()
         conn.execute(
             "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?",
-            (title, datetime.utcnow().isoformat(), session_id),
+            (title, datetime.now(UTC).isoformat(), session_id),
         )
         conn.commit()
 
@@ -142,7 +142,7 @@ def touch_session(session_id: str):
         conn = _get_conn()
         conn.execute(
             "UPDATE sessions SET updated_at = ? WHERE id = ?",
-            (datetime.utcnow().isoformat(), session_id),
+            (datetime.now(UTC).isoformat(), session_id),
         )
         conn.commit()
 
@@ -155,7 +155,7 @@ def add_message(
     result: Optional[Dict[str, Any]] = None,
 ) -> str:
     mid = str(uuid.uuid4())
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(UTC).isoformat()
     with _lock:
         conn = _get_conn()
         conn.execute(
@@ -209,7 +209,7 @@ def add_run(
                 json.dumps(plan) if plan else None,
                 json.dumps(tool_calls) if tool_calls else None,
                 json.dumps(response) if response else None,
-                datetime.utcnow().isoformat(),
+                datetime.now(UTC).isoformat(),
             ),
         )
         conn.commit()

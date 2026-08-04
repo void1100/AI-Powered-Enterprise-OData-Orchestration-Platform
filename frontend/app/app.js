@@ -320,7 +320,7 @@ function addAssistantBubble(summary, result, scroll = true, paginationInfo = nul
   }
   if (result && (result.clarification || (result.tool_calls || []).some((t) => t.type === "entity_clarification" && t.candidates))) {
     const clarifyTool = (result.tool_calls || []).find((t) => t.type === "entity_clarification" && t.candidates);
-    div.appendChild(renderClarification(result.clarification || {
+    div.appendChild(renderClarificationV2(result.clarification || {
       type: "entity_choice",
       query: "",
       candidates: clarifyTool.candidates || [],
@@ -1935,6 +1935,51 @@ function renderClarification(clarification) {
     });
     item.querySelector(".clarify-reject").addEventListener("click", () => {
       item.classList.add("rejected");
+    });
+    wrap.appendChild(item);
+  });
+  return wrap;
+}
+
+function renderClarificationV2(clarification) {
+  const wrap = document.createElement("div");
+  wrap.className = "clarification-panel";
+  const options = clarification.options || (clarification.candidates || []).map((candidate) => ({
+    label: candidate.entity_label || candidate.entity_set || "",
+    value: candidate.entity_set || "",
+    query: `show ${candidate.entity_set || ""}`,
+    entity_set: candidate.entity_set || "",
+    entity_label: candidate.entity_label || "",
+    service_id: candidate.service_id || "",
+    service_name: candidate.service_name || "",
+    description: `${candidate.service_name || candidate.service_id || ""}${candidate.entity_set ? ` · ${candidate.entity_set}` : ""}`,
+    properties: candidate.properties || [],
+  }));
+  const title = clarification.type === "query_scope" ? "Help Me Narrow It Down" : "Possible Matches";
+  const prompt = clarification.prompt ? `<div class="clarification-prompt">${escapeHtml(clarification.prompt)}</div>` : "";
+  wrap.innerHTML = `<div class="section-label">${escapeHtml(title)}</div>${prompt}`;
+  options.forEach((option, index) => {
+    const item = document.createElement("div");
+    item.className = "clarification-item";
+    const label = option.entity_set && option.entity_label && option.entity_label !== option.entity_set
+      ? ` · ${option.entity_set}`
+      : "";
+    const props = (option.properties || []).slice(0, 6).join(", ");
+    const description = option.description || option.service_name || option.service_id || "";
+    const replyValue = option.query || option.value || option.label || "";
+    item.innerHTML = `
+      <div class="clarification-main">
+        <strong>${escapeHtml(option.label || option.entity_set || `Option ${index + 1}`)}</strong>
+        <span>${escapeHtml(description)}${escapeHtml(label)}</span>
+        ${props ? `<small>${escapeHtml(props)}</small>` : ""}
+      </div>
+      <div class="clarification-actions">
+        <button class="clarify-use" type="button">Use This</button>
+      </div>
+    `;
+    item.querySelector(".clarify-use").addEventListener("click", () => {
+      queryInput.value = replyValue;
+      send();
     });
     wrap.appendChild(item);
   });

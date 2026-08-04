@@ -18,6 +18,14 @@ from app.config import settings
 from app.schemas.models import ChatRequest, ChatResponse, TableData
 from app.services.service_manager import service_manager
 from app.services.column_filter import filter_columns
+from app.services.clarification import (
+    build_entity_choice_clarification,
+    build_scope_clarification,
+    extract_pending_clarification,
+    is_generic_scope_query,
+    resolve_pending_clarification,
+    should_ask_scope_clarification,
+)
 from app.services.query_optimizer import query_optimizer
 from app.agents.orchestrator import orchestrator, _normalize_plan
 from app.agents.reasoning_engine import llm_engine
@@ -137,6 +145,40 @@ def _build_chat_response(session_id: str, user_query: str, user_role: str, **kwa
     return ChatResponse(**defaults)
 
 
+def _build_clarification_response(
+    session_id: str,
+    user_query: str,
+    user_role: str,
+    summary: str,
+    clarification: Dict[str, Any],
+    provider: str = "clarification",
+) -> ChatResponse:
+    tool_calls = [{
+        "type": "clarification",
+        "clarification_type": clarification.get("type", "unknown"),
+        "option_count": len(clarification.get("options") or clarification.get("candidates") or []),
+    }]
+    add_message(
+        session_id,
+        "assistant",
+        summary,
+        plan={"intent": "clarify", "summary": summary},
+        result={"tool_calls": tool_calls, "clarification": clarification},
+    )
+    return _build_chat_response(
+        session_id,
+        user_query,
+        user_role,
+        summary=summary,
+        plan={"intent": "clarify", "summary": summary},
+        tool_calls=tool_calls,
+        llm_provider=provider,
+        clarification=clarification,
+    )
+
+
+
+
 # ---------------------------------------------------------------------------
 # /chat
 # ---------------------------------------------------------------------------
@@ -152,6 +194,7 @@ async def chat(payload: ChatRequest, request: Request):
         logger.info(f"Chat received {len(payload.selected_entities)} selected entities: {payload.selected_entities}")
 
     session_id = payload.session_id
+    previous_messages: List[Dict[str, Any]] = []
     if not session_id:
         user_id = user.get("sub") if user else None
         session_id = create_session(
@@ -161,8 +204,35 @@ async def chat(payload: ChatRequest, request: Request):
         )
     else:
         touch_session(session_id)
+        previous_messages = get_messages(session_id, limit=30)
 
     add_message(session_id, "user", payload.query)
+
+    pending_clarification = extract_pending_clarification(previous_messages)
+    if pending_clarification:
+        resolution = resolve_pending_clarification(pending_clarification, payload.query)
+        if resolution.get("clarification"):
+            clarification = resolution["clarification"]
+            summary = clarification.get("prompt") or "I need a bit more detail before I can continue."
+            return _build_clarification_response(
+                session_id,
+                payload.query,
+                user_role,
+                summary,
+                clarification,
+                provider="clarification-followup",
+            )
+        resolved_query = resolution.get("query")
+        if resolved_query:
+            selected_entities = payload.selected_entities
+            if resolution.get("direct_select") and resolution.get("selection"):
+                choice = resolution["selection"]
+                selected_entities = [{
+                    "service_id": choice.get("service_id", ""),
+                    "entity_name": choice.get("entity_set") or choice.get("value") or choice.get("label", ""),
+                    "properties": choice.get("properties", []),
+                }]
+            payload = payload.model_copy(update={"query": resolved_query, "selected_entities": selected_entities})
 
     def _log(provider: str, tokens: int, latency_ms: int, intent: str = "", cached: bool = False):
         _log_chat_usage(session_id, payload.query, user_role, provider, tokens, latency_ms, intent, cached)
@@ -480,12 +550,22 @@ async def chat(payload: ChatRequest, request: Request):
     services_list = service_manager.list_services()
     q_lower = payload.query.lower()
     q_compact = re.sub(r"[^a-z0-9]", "", q_lower)
+    def _entity_matches_query(es: str, q_lower: str, q_compact: str) -> bool:
+        el = es.lower()
+        if el in q_lower or el.replace("_", " ") in q_lower:
+            return True
+        if re.sub(r"[^a-z0-9]", "", el) in q_compact:
+            return True
+        no_prefix = re.sub(r"^[aci]_", "", es, flags=re.IGNORECASE)
+        spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", no_prefix)
+        spaced = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", spaced)
+        spaced = spaced.replace("_", " ").replace("-", " ").replace(".", " ").strip().lower()
+        if spaced and spaced in q_lower:
+            return True
+        return False
+
     exact_entity_requested = any(
-        (
-            es.lower() in q_lower
-            or es.lower().replace("_", " ") in q_lower
-            or re.sub(r"[^a-z0-9]", "", es.lower()) in q_compact
-        )
+        _entity_matches_query(es, q_lower, q_compact)
         for svc in services_list
         for es in svc.get("entity_sets", [])
     )
@@ -541,28 +621,31 @@ async def chat(payload: ChatRequest, request: Request):
 
     # ── Entity candidate clarification ──────────────────────────────────────
     candidates = llm_engine.find_entity_candidates(services_list, payload.query, limit=5)
-    if not exact_entity_requested and len(candidates) >= 2:
+    if not exact_entity_requested and len(candidates) >= 2 and not is_generic_scope_query(payload.query):
         top_score = candidates[0].get("score", 0)
         close_candidates = [c for c in candidates if top_score and c.get("score", 0) >= top_score * 0.7][:3]
         if len(close_candidates) >= 2:
-            candidate_lines = [
-                f"- {c.get('entity_set', '')} ({c.get('service_name') or c.get('service_id', 'service')})"
-                for c in close_candidates
-            ]
-            summary = (
-                "I found multiple possible entities for your request. Choose the one that matches what you mean."
-                "\n\n" + "\n".join(candidate_lines)
+            clarification = build_entity_choice_clarification(payload.query, close_candidates)
+            summary = clarification["prompt"]
+            return _build_clarification_response(
+                session_id,
+                payload.query,
+                user_role,
+                summary,
+                clarification,
+                provider="entity-candidates",
             )
-            clarification = {"type": "entity_choice", "query": payload.query, "candidates": close_candidates}
-            tool_calls_clarify = [{"type": "entity_clarification", "candidate_count": len(close_candidates), "candidates": close_candidates}]
-            add_message(session_id, "assistant", summary, plan={"intent": "clarify", "summary": summary}, result={"tool_calls": tool_calls_clarify, "clarification": clarification})
-            return _build_chat_response(
-                session_id, payload.query, user_role,
-                summary=summary,
-                plan={"intent": "clarify", "summary": summary},
-                tool_calls=tool_calls_clarify,
-                llm_provider="entity-candidates",
-                clarification=clarification,
+
+    if not exact_entity_requested and should_ask_scope_clarification(payload.query, candidates, payload.selected_entities):
+        clarification = build_scope_clarification(payload.query, services_list)
+        if clarification:
+            return _build_clarification_response(
+                session_id,
+                payload.query,
+                user_role,
+                clarification["prompt"],
+                clarification,
+                provider="query-scope",
             )
 
     # ── Main LLM orchestration pipeline ─────────────────────────────────────
